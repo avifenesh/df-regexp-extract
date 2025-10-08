@@ -1,0 +1,6 @@
+.github
+target/
+Cargo.lock
+CLAUDE.md
+AGENTS.md
+.DS_Store

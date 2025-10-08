@@ -1,0 +1,30 @@
+[package]
+name = "df-regexp-extract"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Avi Fenesh aviarchi1994@gmail.com"]
+description = "DataFusion Scalar UDF: Spark-compatible regexp_extract (no SQL API)."
+
+[lib]
+name = "df_regexp_extract"
+path = "src/lib.rs"
+
+[[bin]]
+name = "demo"
+path = "src/bin/demo.rs"
+
+[dependencies]
+datafusion = "50.1"
+regex = "1.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+criterion = { version = "0.7.0", default-features = false, features = ["html_reports"] }
+
+[[bench]]
+name = "regexp_extract"
+harness = false
+
+[profile.release]
+debug = 1
