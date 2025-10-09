@@ -345,8 +345,7 @@ fn find_block_for_string(
     let block_idx = (row_start / block_size) as usize;
 
     if block_idx < blocks.len() {
-        // SAFETY: We just checked block_idx < blocks.len() above
-        let (block_start, block_end, block_id) = unsafe { *blocks.get_unchecked(block_idx) };
+        let (block_start, block_end, block_id) = blocks[block_idx];
         // Verify string is fully contained in this block
         if row_start >= block_start && row_end <= block_end {
             let offset_in_block = (row_start - block_start) as u32;
@@ -808,7 +807,7 @@ fn regexp_extract_kernel(
                 let pattern = pattern_input.value_unchecked(i);
                 let idx_value = idx_input.value_unchecked(i);
                 if idx_value < 0 {
-                    return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
+                    return Err(err_idx_negative());
                 }
 
                 let row_start = offsets[i] as u32;
@@ -906,7 +905,7 @@ fn regexp_extract_kernel(
         let pattern = pattern_input.value_unchecked(i);
         let idx_value = idx_input.value_unchecked(i);
         if idx_value < 0 {
-            return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
+            return Err(err_idx_negative());
         }
 
         // Compile each unique pattern once per batch
