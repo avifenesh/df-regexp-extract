@@ -297,21 +297,22 @@ impl RegexCache {
         }
     }
 
-    /// Returns a cached regex or compiles and caches it.
+    /// Returns a reference to a cached regex or compiles and caches it.
+    /// Avoids Arc cloning on cache hits by returning a reference directly.
     #[inline]
-    fn get_or_insert(&mut self, pattern: &str) -> Result<CompiledRegex> {
-        // Cache hit
-        if let Some(cached) = self.lru.get(pattern) {
-            return Ok(cached.clone());
+    fn get_or_insert(&mut self, pattern: &str) -> Result<&CompiledRegex> {
+        // Check cache first (moves to front on hit)
+        if self.lru.get(pattern).is_some() {
+            // Use peek to get reference without double-moving
+            return Ok(self.lru.peek(pattern).expect("just accessed"));
         }
 
-        // Cache miss
+        // Cache miss - compile and insert
         let compiled = CompiledRegex::new_with_fallback(pattern)?;
+        self.lru.put(pattern.to_string(), compiled);
 
-        // Store result
-        self.lru.put(pattern.to_string(), compiled.clone());
-
-        Ok(compiled)
+        // Get reference to inserted value
+        Ok(self.lru.peek(pattern).expect("just inserted"))
     }
 }
 
