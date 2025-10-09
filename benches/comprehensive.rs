@@ -10,10 +10,15 @@
 mod test_data;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use datafusion::arrow::array::StringArray;
-use df_regexp_extract::eval_regexp_extract_utf8;
+use datafusion::arrow::array::{Int32Array, StringArray};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::datasource::MemTable;
+use datafusion::prelude::*;
+use df_regexp_extract::{eval_regexp_extract_utf8, make_regexp_extract_udf};
 use regex::Regex;
 use std::hint::black_box;
+use std::sync::Arc;
 use test_data::*;
 
 // ===== Data Generation Aligned with PLAN-V1.md =====
@@ -387,6 +392,78 @@ fn bench_batch_sizes(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark: Column pattern cardinality (PLAN-V1 Step 3 baseline before LRU)
+/// Tests per-row regex compilation overhead with low/mid/high cardinality patterns
+fn bench_column_pattern_cardinality(c: &mut Criterion) {
+    let mut group = c.benchmark_group("column_pattern_cardinality");
+    let size = 10_000; // Smaller size since per-row compile is expensive
+
+    // Create tokio runtime for async UDF execution
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    for (name, unique_count) in [
+        ("low_4_uniques", 4),
+        ("mid_128_uniques", 128),
+        ("high_all_unique", size),
+    ]
+    .iter()
+    {
+        // Generate data and pattern column
+        let data_arr = generate_plan_v1_dataset(size, 0.8);
+        let pattern_col = generate_pattern_column(size, *unique_count);
+        let pattern_arr = StringArray::from(pattern_col);
+        let idx_arr = Int32Array::from(vec![1; size]);
+
+        // Create DataFrame
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("data", DataType::Utf8, true),
+            Field::new("pattern", DataType::Utf8, true),
+            Field::new("idx", DataType::Int32, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(data_arr) as _,
+                Arc::new(pattern_arr) as _,
+                Arc::new(idx_arr) as _,
+            ],
+        )
+        .unwrap();
+
+        group.throughput(Throughput::Elements(size as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(name), name, |b, _| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let ctx = SessionContext::new();
+                    let udf = make_regexp_extract_udf();
+                    ctx.register_udf(udf.clone());
+
+                    let provider =
+                        MemTable::try_new(schema.clone(), vec![vec![batch.clone()]]).unwrap();
+                    ctx.register_table("t", Arc::new(provider)).unwrap();
+
+                    let df = ctx
+                        .table("t")
+                        .await
+                        .unwrap()
+                        .select(vec![udf.call(vec![
+                            col("data"),
+                            col("pattern"),
+                            col("idx"),
+                        ])])
+                        .unwrap();
+
+                    let result = df.collect().await.unwrap();
+                    black_box(result);
+                })
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_scalar_pattern_various_sizes,
@@ -398,6 +475,7 @@ criterion_group!(
     bench_realistic_workloads,
     bench_edge_cases,
     bench_batch_sizes,
+    bench_column_pattern_cardinality,
 );
 
 criterion_main!(benches);

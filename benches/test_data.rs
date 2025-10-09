@@ -28,14 +28,6 @@ impl StringLength {
     }
 }
 
-/// Pattern complexity levels
-#[derive(Debug, Clone, Copy)]
-pub enum PatternComplexity {
-    Simple,  // Literal or basic pattern
-    Medium,  // Multiple capturing groups
-    Complex, // Complex alternations and groups
-}
-
 /// Generates test data for simple email-like pattern: word-digits
 pub fn generate_email_like_data(config: &DataConfig) -> StringArray {
     let mut data = Vec::with_capacity(config.size);

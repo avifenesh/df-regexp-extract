@@ -49,7 +49,7 @@ use datafusion::logical_expr::{
 use regex::Regex;
 use std::sync::Arc;
 
-/// Evaluate regexp_extract for a concrete `Utf8` array and pre-compiled pattern.
+/// Evaluates regexp_extract for Utf8 array with pre-compiled regex and group index.
 #[inline]
 pub fn eval_regexp_extract_utf8(input: &StringArray, regex: &Regex, idx: i32) -> Result<ArrayRef> {
     if idx < 0 {
@@ -72,7 +72,7 @@ pub fn eval_regexp_extract_utf8(input: &StringArray, regex: &Regex, idx: i32) ->
     Ok(Arc::new(builder.finish()))
 }
 
-/// Build a DataFusion scalar UDF that performs Spark-compatible `regexp_extract`.
+/// Creates and returns the DataFusion ScalarUDF for regexp_extract.
 #[inline]
 pub fn make_regexp_extract_udf() -> ScalarUDF {
     let signatures = vec![
@@ -98,6 +98,7 @@ pub fn make_regexp_extract_udf() -> ScalarUDF {
     ))
 }
 
+/// Implements the core UDF logic, extracting ColumnarValue inputs and calling kernel.
 #[inline]
 fn regexp_extract_udf_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
     if args.len() != 3 {
@@ -110,11 +111,13 @@ fn regexp_extract_udf_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
     Ok(ColumnarValue::Array(result))
 }
 
+/// Creates an all-null Utf8 array of given length.
 #[inline]
 fn all_null_utf8(n: usize) -> ArrayRef {
     new_null_array(&DataType::Utf8, n)
 }
 
+/// Core kernel for regexp_extract, handling scalar/columnar string, pattern, and index inputs.
 fn regexp_extract_kernel(
     str_arg: &ColumnarValue,
     pat_arg: &ColumnarValue,
@@ -183,6 +186,7 @@ fn regexp_extract_kernel(
     Ok(Arc::new(builder.finish()))
 }
 
+/// Appends the specified capture group (or empty string) from regex match to StringBuilder.
 #[inline]
 fn append_capture(builder: &mut StringBuilder, input: &str, regex: &Regex, idx: usize) {
     match regex.captures(input) {
@@ -194,11 +198,13 @@ fn append_capture(builder: &mut StringBuilder, input: &str, regex: &Regex, idx: 
     }
 }
 
+/// Compiles a regex pattern string, returning error for invalid patterns.
 #[inline]
 fn compile_regex(pattern: &str) -> Result<Regex> {
     Regex::new(pattern).map_err(|err| DataFusionError::Execution(format!("invalid regex: {err}")))
 }
 
+/// Enum for string input: scalar value or Utf8/LargeUtf8 array.
 enum StringInput<'a> {
     Scalar(Option<String>),
     ArrayUtf8(&'a StringArray),
@@ -206,6 +212,7 @@ enum StringInput<'a> {
 }
 
 impl<'a> StringInput<'a> {
+    /// Creates StringInput from ColumnarValue, handling scalar and array cases.
     fn new(arg: &'a ColumnarValue, label: &str) -> Result<Self> {
         match arg {
             ColumnarValue::Scalar(value) => {
@@ -235,6 +242,7 @@ impl<'a> StringInput<'a> {
         }
     }
 
+    /// Returns the length of the input (1 for scalar, array length otherwise).
     #[inline]
     fn len(&self) -> usize {
         match self {
@@ -244,6 +252,7 @@ impl<'a> StringInput<'a> {
         }
     }
 
+    /// Checks if value at index is null.
     #[inline]
     fn is_null(&self, index: usize) -> bool {
         match self {
@@ -253,6 +262,7 @@ impl<'a> StringInput<'a> {
         }
     }
 
+    /// Returns the scalar string value if applicable.
     #[inline]
     fn scalar_value(&self) -> Option<&str> {
         match self {
@@ -261,11 +271,13 @@ impl<'a> StringInput<'a> {
         }
     }
 
+    /// Checks if the input is a scalar null.
     #[inline]
     fn is_scalar_null(&self) -> bool {
         matches!(self, Self::Scalar(None))
     }
 
+    /// Gets non-null value at index (unchecked, assumes non-null).
     #[inline]
     fn value_unchecked(&self, index: usize) -> &str {
         match self {
@@ -276,6 +288,7 @@ impl<'a> StringInput<'a> {
         }
     }
 
+    /// Provides byte capacity hint for builder initialization.
     #[inline]
     fn byte_capacity_hint(&self) -> usize {
         match self {
@@ -287,12 +300,14 @@ impl<'a> StringInput<'a> {
     }
 }
 
+/// Enum for int32 input: scalar value or Int32 array.
 enum Int32Input<'a> {
     Scalar(Option<i32>),
     Array(&'a Int32Array),
 }
 
 impl<'a> Int32Input<'a> {
+    /// Creates Int32Input from ColumnarValue, handling scalar and array cases.
     fn new(arg: &'a ColumnarValue) -> Result<Self> {
         match arg {
             ColumnarValue::Scalar(value) => {
@@ -318,6 +333,7 @@ impl<'a> Int32Input<'a> {
         }
     }
 
+    /// Returns the length of the input (1 for scalar, array length otherwise).
     #[inline]
     fn len(&self) -> usize {
         match self {
@@ -326,6 +342,7 @@ impl<'a> Int32Input<'a> {
         }
     }
 
+    /// Checks if value at index is null.
     #[inline]
     fn is_null(&self, index: usize) -> bool {
         match self {
@@ -334,11 +351,13 @@ impl<'a> Int32Input<'a> {
         }
     }
 
+    /// Checks if the input is a scalar null.
     #[inline]
     fn is_scalar_null(&self) -> bool {
         matches!(self, Self::Scalar(None))
     }
 
+    /// Gets non-null value at index (unchecked, assumes non-null).
     #[inline]
     fn value_unchecked(&self, index: usize) -> i32 {
         match self {
