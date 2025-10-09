@@ -260,3 +260,9 @@ If regex compilation fails, PCRE2 is used instead.
 ### Benchmark Results
 differences are not significant, but some hits in cases where another if in the loop affects the performance.
 Since it a must have feature, it is worth the extra complexity. (Must by the rules i created for myself)
+
+### v0.5
+- Added Utf8View support in order to allow zero copy, as expected the benchmarks are positive where the data is large, not affected in the other cases, and one case show regression.
+Those results are expected, the idea of creating additional pointer/view is worth doing when the overhead worth it, and in small values this is not the case.
+Since we are working with big data systems, and we are in the world of arrow, the zero copy is worth the extra complexity.
+In the key-val world this would require more fine tuning and fences.
