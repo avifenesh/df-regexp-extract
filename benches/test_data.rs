@@ -245,34 +245,3 @@ pub fn generate_identical_strings(size: usize, pattern_matches: bool) -> StringA
     };
     StringArray::from(vec![Some(s); size])
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use datafusion::arrow::array::Array;
-
-    #[test]
-    fn test_email_like_generation() {
-        let config = DataConfig {
-            size: 100,
-            string_length: StringLength::Short,
-            match_rate: 0.8,
-            null_rate: 0.1,
-        };
-        let arr = generate_email_like_data(&config);
-        assert_eq!(arr.len(), 100);
-    }
-
-    #[test]
-    fn test_all_nulls() {
-        let arr = generate_all_nulls(50);
-        assert_eq!(arr.len(), 50);
-        assert_eq!(arr.null_count(), 50);
-    }
-
-    #[test]
-    fn test_identical_strings() {
-        let arr = generate_identical_strings(100, true);
-        assert_eq!(arr.len(), 100);
-    }
-}

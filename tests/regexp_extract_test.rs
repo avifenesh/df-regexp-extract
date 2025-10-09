@@ -1,74 +1,144 @@
-use datafusion::arrow::array::{Array, Int32Array, LargeStringArray, StringArray};
+use datafusion::arrow::array::{Array, ArrayRef, Int32Array, LargeStringArray, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::datasource::MemTable;
+use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::Expr;
 use datafusion::prelude::*;
-use df_regexp_extract::{eval_regexp_extract_utf8, make_regexp_extract_udf};
-use regex::Regex;
+use df_regexp_extract::make_regexp_extract_udf;
 use std::sync::Arc;
 
-#[test]
-fn kernel_happy_path() {
-    let arr = StringArray::from(vec![Some("abc-123"), Some("zzz"), Some("123")]);
-    let re = Regex::new(r"(\w+)-(\d+)").unwrap();
-    // idx=1
-    let out = eval_regexp_extract_utf8(&arr, &re, 1).unwrap();
-    let s = out.as_any().downcast_ref::<StringArray>().unwrap();
-    assert_eq!(s.value(0), "abc");
-    assert_eq!(s.value(1), "");
-    assert_eq!(s.value(2), "");
-    // idx=0 full match
-    let out0 = eval_regexp_extract_utf8(&arr, &re, 0).unwrap();
-    let s0 = out0.as_any().downcast_ref::<StringArray>().unwrap();
-    assert_eq!(s0.value(0), "abc-123");
-    assert_eq!(s0.value(1), "");
-    assert_eq!(s0.value(2), "");
+async fn run_extract(
+    strings: Vec<Option<&'static str>>,
+    pattern: &str,
+    idx: Option<i32>,
+) -> DFResult<Vec<Option<String>>> {
+    let ctx = SessionContext::new();
+    let udf = make_regexp_extract_udf();
+    ctx.register_udf(udf.clone());
+
+    let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+    let array: ArrayRef = Arc::new(StringArray::from(strings));
+    let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+    let provider = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+    ctx.register_table("extract_input", Arc::new(provider))
+        .unwrap();
+
+    let pattern_expr = Expr::Literal(ScalarValue::Utf8(Some(pattern.to_string())), None);
+    let call_expr = match idx {
+        Some(i) => udf.call(vec![
+            col("s"),
+            pattern_expr.clone(),
+            Expr::Literal(ScalarValue::Int32(Some(i)), None),
+        ]),
+        None => udf.call(vec![col("s"), pattern_expr.clone()]),
+    };
+
+    let df = ctx
+        .table("extract_input")
+        .await
+        .unwrap()
+        .select(vec![call_expr.alias("g")])
+        .unwrap();
+    let batches = df.collect().await?;
+    let col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    Ok((0..col.len())
+        .map(|i| {
+            if col.is_null(i) {
+                None
+            } else {
+                Some(col.value(i).to_string())
+            }
+        })
+        .collect())
 }
 
-#[test]
-fn kernel_nulls_and_no_match() {
-    let arr = StringArray::from(vec![None, Some("city-99"), Some("nomatch")]);
-    let re = Regex::new(r"(\w+)-(\d+)").unwrap();
+#[tokio::test(flavor = "current_thread")]
+async fn kernel_happy_path() {
+    let idx1 = run_extract(
+        vec![Some("abc-123"), Some("zzz"), Some("123")],
+        "(\\w+)-(\\d+)",
+        Some(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        idx1,
+        vec![
+            Some("abc".to_string()),
+            Some("".to_string()),
+            Some("".to_string())
+        ]
+    );
 
-    let out = eval_regexp_extract_utf8(&arr, &re, 2).unwrap();
-    let s = out.as_any().downcast_ref::<StringArray>().unwrap();
-    assert!(s.is_null(0));
-    assert_eq!(s.value(1), "99");
-    assert_eq!(s.value(2), "");
+    let idx0 = run_extract(
+        vec![Some("abc-123"), Some("zzz"), Some("123")],
+        "(\\w+)-(\\d+)",
+        Some(0),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        idx0,
+        vec![
+            Some("abc-123".to_string()),
+            Some("".to_string()),
+            Some("".to_string())
+        ]
+    );
 }
 
-#[test]
-fn kernel_group_out_of_range_returns_empty() {
-    let arr = StringArray::from(vec![Some("foo-42"), Some("onlytext")]);
-    let re = Regex::new(r"(\w+)-(\d+)").unwrap();
-
-    let out = eval_regexp_extract_utf8(&arr, &re, 3).unwrap();
-    let s = out.as_any().downcast_ref::<StringArray>().unwrap();
-    assert_eq!(s.value(0), "");
-    assert_eq!(s.value(1), "");
+#[tokio::test(flavor = "current_thread")]
+async fn kernel_nulls_and_no_match() {
+    let out = run_extract(
+        vec![None, Some("city-99"), Some("nomatch")],
+        "(\\w+)-(\\d+)",
+        Some(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out,
+        vec![None, Some("99".to_string()), Some("".to_string())]
+    );
 }
 
-#[test]
-fn kernel_optional_group_yields_empty_capture() {
-    let arr = StringArray::from(vec![Some("color:red"), Some("color:")]);
-    let re = Regex::new(r"color:(red)?").unwrap();
-
-    let out = eval_regexp_extract_utf8(&arr, &re, 1).unwrap();
-    let s = out.as_any().downcast_ref::<StringArray>().unwrap();
-    assert_eq!(s.value(0), "red");
-    assert_eq!(s.value(1), "");
+#[tokio::test(flavor = "current_thread")]
+async fn kernel_group_out_of_range_returns_empty() {
+    let out = run_extract(
+        vec![Some("foo-42"), Some("onlytext")],
+        "(\\w+)-(\\d+)",
+        Some(3),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, vec![Some("".to_string()), Some("".to_string())]);
 }
 
-#[test]
-fn kernel_returns_first_match_only() {
-    let arr = StringArray::from(vec![Some("id=10 id=20")]);
-    let re = Regex::new(r"id=(\d+)").unwrap();
+#[tokio::test(flavor = "current_thread")]
+async fn kernel_optional_group_yields_empty_capture() {
+    let out = run_extract(
+        vec![Some("color:red"), Some("color:")],
+        "color:(red)?",
+        Some(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, vec![Some("red".to_string()), Some("".to_string())]);
+}
 
-    let out = eval_regexp_extract_utf8(&arr, &re, 1).unwrap();
-    let s = out.as_any().downcast_ref::<StringArray>().unwrap();
-    assert_eq!(s.value(0), "10");
+#[tokio::test(flavor = "current_thread")]
+async fn kernel_returns_first_match_only() {
+    let out = run_extract(vec![Some("id=10 id=20")], "id=(\\d+)", Some(1))
+        .await
+        .unwrap();
+    assert_eq!(out, vec![Some("10".to_string())]);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -425,10 +495,10 @@ async fn spark_parity_doc_examples() {
     assert_eq!(second.value(2), "");
 }
 
-#[test]
-fn idx_negative_errors() {
-    let arr = StringArray::from(vec![Some("abc-123")]);
-    let re = Regex::new(r"(\w+)-(\d+)").unwrap();
-    let err = eval_regexp_extract_utf8(&arr, &re, -1).unwrap_err();
+#[tokio::test(flavor = "current_thread")]
+async fn idx_negative_errors() {
+    let err = run_extract(vec![Some("abc-123")], "(\\w+)-(\\d+)", Some(-1))
+        .await
+        .unwrap_err();
     assert!(format!("{err}").contains("idx must be >= 0"));
 }

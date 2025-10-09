@@ -10,16 +10,52 @@
 mod test_data;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use datafusion::arrow::array::{Int32Array, StringArray};
+use datafusion::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
-use datafusion::prelude::*;
-use df_regexp_extract::{eval_regexp_extract_utf8, make_regexp_extract_udf};
+use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::prelude::{SessionContext, col};
+use df_regexp_extract::make_regexp_extract_udf;
 use regex::Regex;
 use std::hint::black_box;
 use std::sync::Arc;
 use test_data::*;
+
+fn bench_eval_regexp_extract_utf8(
+    input: &StringArray,
+    regex: &Regex,
+    idx: i32,
+) -> DFResult<ArrayRef> {
+    if idx < 0 {
+        return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
+    }
+
+    let len = input.len();
+    let mut builder = StringBuilder::with_capacity(len, input.values().len());
+    let capture_idx = idx as usize;
+
+    for i in 0..len {
+        if input.is_null(i) {
+            builder.append_null();
+            continue;
+        }
+        let value = input.value(i);
+        append_capture(&mut builder, value, regex, capture_idx);
+    }
+
+    Ok(Arc::new(builder.finish()))
+}
+
+fn append_capture(builder: &mut StringBuilder, input: &str, regex: &Regex, idx: usize) {
+    match regex.captures(input) {
+        Some(caps) => {
+            let s = caps.get(idx).map(|m| m.as_str()).unwrap_or("");
+            builder.append_value(s);
+        }
+        None => builder.append_value(""),
+    }
+}
 
 // ===== Data Generation Aligned with PLAN-V1.md =====
 
@@ -109,7 +145,8 @@ fn bench_scalar_pattern_various_sizes(c: &mut Criterion) {
         group.throughput(Throughput::Elements(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, _| {
             b.iter(|| {
-                let out = eval_regexp_extract_utf8(black_box(&arr), black_box(&re), 1).unwrap();
+                let out =
+                    bench_eval_regexp_extract_utf8(black_box(&arr), black_box(&re), 1).unwrap();
                 black_box(out);
             });
         });
@@ -133,7 +170,8 @@ fn bench_match_rates(c: &mut Criterion) {
             match_rate,
             |b, _| {
                 b.iter(|| {
-                    let out = eval_regexp_extract_utf8(black_box(&arr), black_box(&re), 1).unwrap();
+                    let out =
+                        bench_eval_regexp_extract_utf8(black_box(&arr), black_box(&re), 1).unwrap();
                     black_box(out);
                 });
             },
@@ -167,7 +205,8 @@ fn bench_string_lengths(c: &mut Criterion) {
         group.throughput(Throughput::Elements(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(name), name, |b, _| {
             b.iter(|| {
-                let out = eval_regexp_extract_utf8(black_box(&arr), black_box(&re), 1).unwrap();
+                let out =
+                    bench_eval_regexp_extract_utf8(black_box(&arr), black_box(&re), 1).unwrap();
                 black_box(out);
             });
         });
@@ -197,7 +236,8 @@ fn bench_null_rates(c: &mut Criterion) {
             null_rate,
             |b, _| {
                 b.iter(|| {
-                    let out = eval_regexp_extract_utf8(black_box(&arr), black_box(&re), 1).unwrap();
+                    let out =
+                        bench_eval_regexp_extract_utf8(black_box(&arr), black_box(&re), 1).unwrap();
                     black_box(out);
                 });
             },
@@ -222,7 +262,8 @@ fn bench_group_indices(c: &mut Criterion) {
             |b, &idx_val| {
                 b.iter(|| {
                     let out =
-                        eval_regexp_extract_utf8(black_box(&arr), black_box(&re), idx_val).unwrap();
+                        bench_eval_regexp_extract_utf8(black_box(&arr), black_box(&re), idx_val)
+                            .unwrap();
                     black_box(out);
                 });
             },
@@ -257,7 +298,8 @@ fn bench_pattern_complexity(c: &mut Criterion) {
         group.throughput(Throughput::Elements(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(name), name, |b, _| {
             b.iter(|| {
-                let out = eval_regexp_extract_utf8(black_box(&arr), black_box(&re), 1).unwrap();
+                let out =
+                    bench_eval_regexp_extract_utf8(black_box(&arr), black_box(&re), 1).unwrap();
                 black_box(out);
             });
         });
@@ -284,7 +326,8 @@ fn bench_realistic_workloads(c: &mut Criterion) {
     group.throughput(Throughput::Elements(size as u64));
     group.bench_function("log_lines", |b| {
         b.iter(|| {
-            let out = eval_regexp_extract_utf8(black_box(&log_arr), black_box(&log_re), 1).unwrap();
+            let out =
+                bench_eval_regexp_extract_utf8(black_box(&log_arr), black_box(&log_re), 1).unwrap();
             black_box(out);
         });
     });
@@ -302,7 +345,8 @@ fn bench_realistic_workloads(c: &mut Criterion) {
     group.throughput(Throughput::Elements(size as u64));
     group.bench_function("urls", |b| {
         b.iter(|| {
-            let out = eval_regexp_extract_utf8(black_box(&url_arr), black_box(&url_re), 2).unwrap();
+            let out =
+                bench_eval_regexp_extract_utf8(black_box(&url_arr), black_box(&url_re), 2).unwrap();
             black_box(out);
         });
     });
@@ -320,7 +364,8 @@ fn bench_realistic_workloads(c: &mut Criterion) {
     group.throughput(Throughput::Elements(size as u64));
     group.bench_function("structured_kv", |b| {
         b.iter(|| {
-            let out = eval_regexp_extract_utf8(black_box(&kv_arr), black_box(&kv_re), 1).unwrap();
+            let out =
+                bench_eval_regexp_extract_utf8(black_box(&kv_arr), black_box(&kv_re), 1).unwrap();
             black_box(out);
         });
     });
@@ -339,7 +384,8 @@ fn bench_edge_cases(c: &mut Criterion) {
     group.throughput(Throughput::Elements(size as u64));
     group.bench_function("all_nulls", |b| {
         b.iter(|| {
-            let out = eval_regexp_extract_utf8(black_box(&all_nulls), black_box(&re), 1).unwrap();
+            let out =
+                bench_eval_regexp_extract_utf8(black_box(&all_nulls), black_box(&re), 1).unwrap();
             black_box(out);
         });
     });
@@ -349,8 +395,8 @@ fn bench_edge_cases(c: &mut Criterion) {
     group.throughput(Throughput::Elements(size as u64));
     group.bench_function("all_identical_matching", |b| {
         b.iter(|| {
-            let out =
-                eval_regexp_extract_utf8(black_box(&all_matching), black_box(&re), 1).unwrap();
+            let out = bench_eval_regexp_extract_utf8(black_box(&all_matching), black_box(&re), 1)
+                .unwrap();
             black_box(out);
         });
     });
@@ -360,7 +406,8 @@ fn bench_edge_cases(c: &mut Criterion) {
     group.bench_function("all_identical_non_matching", |b| {
         b.iter(|| {
             let out =
-                eval_regexp_extract_utf8(black_box(&all_non_matching), black_box(&re), 1).unwrap();
+                bench_eval_regexp_extract_utf8(black_box(&all_non_matching), black_box(&re), 1)
+                    .unwrap();
             black_box(out);
         });
     });
@@ -382,7 +429,8 @@ fn bench_batch_sizes(c: &mut Criterion) {
             batch_size,
             |b, _| {
                 b.iter(|| {
-                    let out = eval_regexp_extract_utf8(black_box(&arr), black_box(&re), 1).unwrap();
+                    let out =
+                        bench_eval_regexp_extract_utf8(black_box(&arr), black_box(&re), 1).unwrap();
                     black_box(out);
                 });
             },

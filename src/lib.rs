@@ -49,30 +49,7 @@ use datafusion::logical_expr::{
 use regex::Regex;
 use std::sync::Arc;
 
-/// Evaluates regexp_extract for Utf8 array with pre-compiled regex and group index.
-#[inline]
-pub fn eval_regexp_extract_utf8(input: &StringArray, regex: &Regex, idx: i32) -> Result<ArrayRef> {
-    if idx < 0 {
-        return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
-    }
-
-    let len = input.len();
-    let mut builder = StringBuilder::with_capacity(len, input.values().len());
-
-    let capture_idx = idx as usize;
-    for i in 0..len {
-        if input.is_null(i) {
-            builder.append_null();
-            continue;
-        }
-        let value = input.value(i);
-        append_capture(&mut builder, value, regex, capture_idx);
-    }
-
-    Ok(Arc::new(builder.finish()))
-}
-
-/// Creates and returns the DataFusion ScalarUDF for regexp_extract.
+/// Public entry point: build and return the DataFusion `ScalarUDF` registered as `"regexp_extract"`.
 #[inline]
 pub fn make_regexp_extract_udf() -> ScalarUDF {
     let signatures = vec![
@@ -161,7 +138,8 @@ fn regexp_extract_kernel(
     let mut builder = StringBuilder::with_capacity(n, data_capacity);
 
     if let Some(pattern) = pattern_input.scalar_value() {
-        let regex = compile_regex(pattern)?;
+        let regex = Regex::new(pattern)
+            .map_err(|err| DataFusionError::Execution(format!("invalid regex: {err}")))?;
         for i in 0..n {
             if string_input.is_null(i) || idx_input.is_null(i) {
                 builder.append_null();
@@ -188,7 +166,8 @@ fn regexp_extract_kernel(
         if idx_value < 0 {
             return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
         }
-        let regex = compile_regex(pattern)?;
+        let regex = Regex::new(pattern)
+            .map_err(|err| DataFusionError::Execution(format!("invalid regex: {err}")))?;
         append_capture(&mut builder, s, &regex, idx_value as usize);
     }
 
@@ -205,12 +184,6 @@ fn append_capture(builder: &mut StringBuilder, input: &str, regex: &Regex, idx: 
         }
         None => builder.append_value(""),
     }
-}
-
-/// Compiles a regex pattern string, returning error for invalid patterns.
-#[inline]
-fn compile_regex(pattern: &str) -> Result<Regex> {
-    Regex::new(pattern).map_err(|err| DataFusionError::Execution(format!("invalid regex: {err}")))
 }
 
 /// Enum for string input: scalar value or Utf8/LargeUtf8 array.

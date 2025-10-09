@@ -122,7 +122,7 @@ fn generate_null_rate_files() -> Result<(), Box<dyn std::error::Error>> {
         for i in 0..size {
             let is_null = (i as f64 / size as f64) < rate;
             if is_null {
-                writeln!(writer, "")?; // Empty for NULL
+                writeln!(writer)?; // Empty for NULL
             } else {
                 writeln!(writer, "user{}-{}", i % 1000, 100 + (i % 900))?;
             }
@@ -228,12 +228,10 @@ fn generate_column_pattern_files() -> Result<(), Box<dyn std::error::Error>> {
     println!("Generating column_patterns files...");
     let size = 10_000;
 
-    let base_patterns = vec![
-        r"(\w+)-(\d+)",
+    let base_patterns = [r"(\w+)-(\d+)",
         r"([a-z]+)_(\d{3})",
         r"^user(\d+)$",
-        r"(\w{3,5})-(\d{2,4})",
-    ];
+        r"(\w{3,5})-(\d{2,4})"];
 
     // Low cardinality (4 unique patterns)
     {
@@ -292,7 +290,7 @@ fn generate_edge_case_files() -> Result<(), Box<dyn std::error::Error>> {
         writeln!(writer, "text")?;
 
         for _ in 0..size {
-            writeln!(writer, "")?; // Empty for NULL
+            writeln!(writer)?; // Empty for NULL
         }
 
         println!("  ✓ data/edge_cases/all_nulls.csv");
