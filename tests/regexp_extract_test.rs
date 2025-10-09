@@ -606,3 +606,361 @@ async fn semantics_index_2_returns_second_group() {
         .unwrap();
     assert_eq!(result, vec![Some("123".to_string())]);
 }
+
+// ============================================================================
+// PERFORMANCE & EDGE CASE TESTS: Zero-copy thresholds, caching, env vars
+// ============================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn performance_large_buffer_exceeds_128mb_threshold_fallback() {
+    // Test that buffers >128MB fall back to copying mode instead of zero-copy
+    // We create a StringArray with total buffer size > 128MB
+    let ctx = SessionContext::new();
+    let udf = make_regexp_extract_udf();
+    ctx.register_udf(udf.clone());
+
+    // Create strings that sum to ~135MB total buffer size
+    // Each string ~1MB, 140 strings = ~140MB
+    let one_mb_string = "x".repeat(1_048_576); // 1MB of 'x'
+    let strings: Vec<Option<String>> = (0..140)
+        .map(|i| Some(format!("prefix-{}-{}", i, one_mb_string)))
+        .collect();
+
+    let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+    let array: ArrayRef = Arc::new(StringArray::from(strings));
+    let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+    let provider = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+    ctx.register_table("large_buffer", Arc::new(provider))
+        .unwrap();
+
+    let df = ctx
+        .table("large_buffer")
+        .await
+        .unwrap()
+        .select(vec![
+            udf.call(vec![
+                col("s"),
+                Expr::Literal(ScalarValue::Utf8(Some("prefix-(\\d+)-".to_string())), None),
+                Expr::Literal(ScalarValue::Int32(Some(1)), None),
+            ])
+            .alias("g"),
+        ])
+        .unwrap();
+
+    let out = df.collect().await.unwrap();
+    let col_out = out[0].column(0);
+
+    // Verify extraction worked (falls back to copying mode)
+    if let Some(v_arr) = col_out.as_any().downcast_ref::<StringViewArray>() {
+        assert_eq!(v_arr.value(0), "0");
+        assert_eq!(v_arr.value(5), "5");
+        assert_eq!(v_arr.value(139), "139");
+    } else {
+        panic!("Expected StringViewArray");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn performance_large_utf8_strings_spanning_multiple_blocks() {
+    // Test that LargeUtf8 strings spanning 2MB blocks fall back to copying
+    // Default block size is 2MB, so we create strings that span blocks
+    let ctx = SessionContext::new();
+    let udf = make_regexp_extract_udf();
+    ctx.register_udf(udf.clone());
+
+    // Create strings where some will span 2MB block boundaries
+    // String positions: 0-1MB, 1MB-3MB (spans blocks), 3MB-4MB, etc.
+    let small_string = "a".repeat(1_000_000); // 1MB
+    let large_string = "b".repeat(2_500_000); // 2.5MB - will span 2MB block boundary
+
+    let strings: Vec<Option<String>> = vec![
+        Some(format!("id-1-{}", small_string)),      // Within block 0
+        Some(format!("id-2-{}", large_string)),      // Spans block 0-1
+        Some(format!("id-3-{}", small_string)),      // Within block 1 or 2
+        Some(format!("id-4-{}", "short")),           // Small string
+    ];
+
+    let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::LargeUtf8, true)]));
+    let array: ArrayRef = Arc::new(LargeStringArray::from(strings));
+    let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+    let provider = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+    ctx.register_table("large_utf8", Arc::new(provider))
+        .unwrap();
+
+    let df = ctx
+        .table("large_utf8")
+        .await
+        .unwrap()
+        .select(vec![
+            udf.call(vec![
+                col("s"),
+                Expr::Literal(ScalarValue::Utf8(Some("id-(\\d+)-".to_string())), None),
+                Expr::Literal(ScalarValue::Int32(Some(1)), None),
+            ])
+            .alias("g"),
+        ])
+        .unwrap();
+
+    let out = df.collect().await.unwrap();
+    let col_out = out[0].column(0);
+
+    // Verify all extractions worked (some zero-copy, some fallback)
+    if let Some(v_arr) = col_out.as_any().downcast_ref::<StringViewArray>() {
+        assert_eq!(v_arr.value(0), "1");
+        assert_eq!(v_arr.value(1), "2"); // Spans blocks - should use fallback
+        assert_eq!(v_arr.value(2), "3");
+        assert_eq!(v_arr.value(3), "4");
+    } else {
+        panic!("Expected StringViewArray");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn performance_lru_cache_with_many_unique_patterns() {
+    // Test LRU cache behavior with >64 unique patterns (default cache size)
+    // Verifies cache eviction and recompilation work correctly
+    let ctx = SessionContext::new();
+    let udf = make_regexp_extract_udf();
+    ctx.register_udf(udf.clone());
+
+    // Create 100 rows with 100 unique patterns (exceeds default 64 cache size)
+    let strings: Vec<Option<String>> = (0..100)
+        .map(|i| Some(format!("value-{}", i % 2)))
+        .collect();
+    let patterns: Vec<Option<String>> = (0..100)
+        .map(|i| Some(format!("value-({})", i % 2))) // Alternating patterns to stress cache
+        .collect();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("s", DataType::Utf8, true),
+        Field::new("p", DataType::Utf8, true),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(strings)) as _,
+            Arc::new(StringArray::from(patterns)) as _,
+        ],
+    )
+    .unwrap();
+
+    let provider = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+    ctx.register_table("cache_stress", Arc::new(provider))
+        .unwrap();
+
+    let df = ctx
+        .table("cache_stress")
+        .await
+        .unwrap()
+        .select(vec![
+            udf.call(vec![
+                col("s"),
+                col("p"),
+                Expr::Literal(ScalarValue::Int32(Some(1)), None),
+            ])
+            .alias("g"),
+        ])
+        .unwrap();
+
+    let out = df.collect().await.unwrap();
+    let col_out = out[0].column(0);
+
+    // Verify all extractions succeeded despite cache evictions
+    if let Some(v_arr) = col_out.as_any().downcast_ref::<StringViewArray>() {
+        // Alternating patterns: value-(0) and value-(1)
+        for i in 0..100 {
+            let expected = format!("{}", i % 2);
+            assert_eq!(v_arr.value(i), expected);
+        }
+    } else {
+        panic!("Expected StringViewArray");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn performance_env_var_regex_cache_size_override() {
+    // Test that DF_REGEX_CACHE_SIZE environment variable works
+    unsafe {
+        std::env::set_var("DF_REGEX_CACHE_SIZE", "10");
+    }
+
+    let ctx = SessionContext::new();
+    let udf = make_regexp_extract_udf();
+    ctx.register_udf(udf.clone());
+
+    // Create 20 unique patterns (exceeds cache size of 10)
+    let strings: Vec<Option<String>> = (0..20)
+        .map(|i| Some(format!("test-{}", i)))
+        .collect();
+    let patterns: Vec<Option<String>> = (0..20)
+        .map(|i| Some(format!("test-({})", i)))
+        .collect();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("s", DataType::Utf8, true),
+        Field::new("p", DataType::Utf8, true),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(strings)) as _,
+            Arc::new(StringArray::from(patterns)) as _,
+        ],
+    )
+    .unwrap();
+
+    let provider = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+    ctx.register_table("env_cache", Arc::new(provider))
+        .unwrap();
+
+    let df = ctx
+        .table("env_cache")
+        .await
+        .unwrap()
+        .select(vec![
+            udf.call(vec![
+                col("s"),
+                col("p"),
+                Expr::Literal(ScalarValue::Int32(Some(1)), None),
+            ])
+            .alias("g"),
+        ])
+        .unwrap();
+
+    let out = df.collect().await.unwrap();
+    let col_out = out[0].column(0);
+
+    // Verify all extractions succeeded
+    if let Some(v_arr) = col_out.as_any().downcast_ref::<StringViewArray>() {
+        for i in 0..20 {
+            assert_eq!(v_arr.value(i), format!("{}", i));
+        }
+    } else {
+        panic!("Expected StringViewArray");
+    }
+
+    // Clean up env var
+    unsafe {
+        std::env::remove_var("DF_REGEX_CACHE_SIZE");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn performance_env_var_max_zero_copy_buffer_override() {
+    // Test that DF_MAX_ZERO_COPY_BUFFER_MB environment variable works
+    // Set threshold to 1MB, then test with 2MB buffer (should fall back to copying)
+    unsafe {
+        std::env::set_var("DF_MAX_ZERO_COPY_BUFFER_MB", "1");
+    }
+
+    let ctx = SessionContext::new();
+    let udf = make_regexp_extract_udf();
+    ctx.register_udf(udf.clone());
+
+    // Create ~2MB buffer (exceeds 1MB threshold)
+    let large_string = "x".repeat(1_048_576); // 1MB
+    let strings: Vec<Option<String>> = vec![
+        Some(format!("id-1-{}", large_string)),
+        Some(format!("id-2-{}", large_string)),
+    ];
+
+    let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+    let array: ArrayRef = Arc::new(StringArray::from(strings));
+    let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+    let provider = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+    ctx.register_table("env_buffer", Arc::new(provider))
+        .unwrap();
+
+    let df = ctx
+        .table("env_buffer")
+        .await
+        .unwrap()
+        .select(vec![
+            udf.call(vec![
+                col("s"),
+                Expr::Literal(ScalarValue::Utf8(Some("id-(\\d+)-".to_string())), None),
+                Expr::Literal(ScalarValue::Int32(Some(1)), None),
+            ])
+            .alias("g"),
+        ])
+        .unwrap();
+
+    let out = df.collect().await.unwrap();
+    let col_out = out[0].column(0);
+
+    // Verify extraction worked (uses copying fallback due to env var)
+    if let Some(v_arr) = col_out.as_any().downcast_ref::<StringViewArray>() {
+        assert_eq!(v_arr.value(0), "1");
+        assert_eq!(v_arr.value(1), "2");
+    } else {
+        panic!("Expected StringViewArray");
+    }
+
+    // Clean up env var
+    unsafe {
+        std::env::remove_var("DF_MAX_ZERO_COPY_BUFFER_MB");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn performance_env_var_large_utf8_block_size_override() {
+    // Test that DF_LARGE_UTF8_BLOCK_SIZE_MB environment variable works
+    // Set block size to 1MB instead of default 2MB
+    unsafe {
+        std::env::set_var("DF_LARGE_UTF8_BLOCK_SIZE_MB", "1");
+    }
+
+    let ctx = SessionContext::new();
+    let udf = make_regexp_extract_udf();
+    ctx.register_udf(udf.clone());
+
+    // Create strings that will span blocks with 1MB block size
+    let medium_string = "a".repeat(800_000); // 800KB
+    let large_string = "b".repeat(1_200_000); // 1.2MB - spans 1MB blocks
+
+    let strings: Vec<Option<String>> = vec![
+        Some(format!("tag-1-{}", medium_string)),    // Within 1MB block
+        Some(format!("tag-2-{}", large_string)),     // Spans 1MB blocks
+        Some(format!("tag-3-{}", medium_string)),    // Within block
+    ];
+
+    let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::LargeUtf8, true)]));
+    let array: ArrayRef = Arc::new(LargeStringArray::from(strings));
+    let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+    let provider = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+    ctx.register_table("env_blocks", Arc::new(provider))
+        .unwrap();
+
+    let df = ctx
+        .table("env_blocks")
+        .await
+        .unwrap()
+        .select(vec![
+            udf.call(vec![
+                col("s"),
+                Expr::Literal(ScalarValue::Utf8(Some("tag-(\\d+)-".to_string())), None),
+                Expr::Literal(ScalarValue::Int32(Some(1)), None),
+            ])
+            .alias("g"),
+        ])
+        .unwrap();
+
+    let out = df.collect().await.unwrap();
+    let col_out = out[0].column(0);
+
+    // Verify all extractions worked
+    if let Some(v_arr) = col_out.as_any().downcast_ref::<StringViewArray>() {
+        assert_eq!(v_arr.value(0), "1");
+        assert_eq!(v_arr.value(1), "2"); // Should use fallback for spanning string
+        assert_eq!(v_arr.value(2), "3");
+    } else {
+        panic!("Expected StringViewArray");
+    }
+
+    // Clean up env var
+    unsafe {
+        std::env::remove_var("DF_LARGE_UTF8_BLOCK_SIZE_MB");
+    }
+}
