@@ -1,229 +1,350 @@
-use datafusion::arrow::array::{Array, ArrayRef, GenericStringArray, StringArray, StringBuilder};
+//! TODO Roadmap (iterations)
+//! 1) Step-2: Regex compatibility fallback
+//!    - Auto-fallback to full PCRE features (look-around/backrefs) when `regex` compile fails.
+//!    - Option A: `fancy-regex` (pure Rust). Option B (feature-gated): PCRE2 via FFI.
+//!    - Safety knobs: match timeout / step budget; telemetry for fallback hits.
+//!
+//! 2) Step-3: Column pattern/idx baseline (done in Step-1 brute-force)
+//!    - Keep per-row compile for correctness; measure cost (criterion benches).
+//!    - Ensure NULL fast paths remain tight for column args.
+//!
+//! 3) Step-4: Per-batch LRU cache for column patterns
+//!    - Tiny LRU (cap 32–128) mapping `pattern -> compiled` to avoid re-compiles in a batch.
+//!    - Batch-scoped only (no global locks); record LRU hit/miss.
+//!
+//! 4) Step-5: Parallel compile of unique patterns (heuristic, bounded)
+//!    - Detect many uniques (e.g., unique_count > 64 && unique_ratio > 0.25).
+//!    - Pre-scan batch, compile uniques with a small thread pool (<= half physical cores).
+//!    - Matching remains single-threaded for cache locality.
+//!
+//! 5) Step-6: Benchmarks & metrics
+//!    - Criterion suites: scalar pat, low/mid/high-card column pat; batch sizes 8k/64k/256k.
+//!    - Export counters: fallback_hits, lru_hits, parallel_compile_time_ms, rows/s.
+//!
+//! 6) Step-7: String ergonomics
+//!    - Add zero-copy support for `LargeUtf8` / `StringView` (avoid copying into Utf8).
+//!    - Confirm capacity hints stay accurate with new string forms.
+//!
+//! 7) Step-8: Spark parity polish
+//!    - Confirm literal negative `idx` fails at plan time (done); column negative at runtime.
+//!    - Document engine differences and fallback semantics.
+//!
+//! 8) Step-9: Configuration surface
+//!    - Feature flag `pcre2` for PCRE backend; env/config for match limits and pool size.
+//!    - Expose knobs via UDF registry metadata if needed.
+//!
+//! 9) Step-10: Robustness
+//!    - Add property tests (proptest) and fuzzing for regex/match paths.
+//!    - Add adversarial patterns (catastrophic backtracking) to validate guards.
+use datafusion::arrow::array::{
+    Array, ArrayRef, Int32Array, LargeStringArray, StringArray, StringBuilder, new_null_array,
+};
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::{DataFusionError, Result, ScalarValue};
-use datafusion::logical_expr::{create_udf, ColumnarValue, Volatility};
+use datafusion::common::ScalarValue;
+use datafusion::error::{DataFusionError, Result};
+use datafusion::logical_expr::{
+    ColumnarValue, ScalarFunctionImplementation, ScalarUDF, Signature, TypeSignature, Volatility,
+    expr_fn::SimpleScalarUDF,
+};
 use regex::Regex;
 use std::sync::Arc;
 
-// Spark-compatible behavior:
-// - idx >= 0
-// - idx == 0 -> entire match
-// - No match or group out-of-range -> empty string (not NULL)
-// - Any NULL input -> result NULL
-pub fn eval_regexp_extract_utf8(arr: &StringArray, regex: &Regex, idx: i32) -> Result<ArrayRef> {
+/// Evaluate regexp_extract for a concrete `Utf8` array and pre-compiled pattern.
+#[inline]
+pub fn eval_regexp_extract_utf8(input: &StringArray, regex: &Regex, idx: i32) -> Result<ArrayRef> {
     if idx < 0 {
-        return Err(DataFusionError::Execution(
-            "regexp_extract: idx must be >= 0".into(),
-        ));
+        return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
     }
-    let len = arr.len();
-    let mut b = StringBuilder::new();
+
+    let len = input.len();
+    let mut builder = StringBuilder::with_capacity(len, input.values().len());
+
+    let capture_idx = idx as usize;
     for i in 0..len {
-        if arr.is_null(i) {
-            b.append_null();
+        if input.is_null(i) {
+            builder.append_null();
             continue;
         }
-        let s = arr.value(i);
-        if let Some(caps) = regex.captures(s) {
-            let out = if idx == 0 {
-                caps.get(0).map(|m| m.as_str()).unwrap_or("")
-            } else {
-                caps.get(idx as usize).map(|m| m.as_str()).unwrap_or("")
-            };
-            b.append_value(out);
-        } else {
-            b.append_value("");
-        }
+        let value = input.value(i);
+        append_capture(&mut builder, value, regex, capture_idx);
     }
-    Ok(Arc::new(b.finish()))
+
+    Ok(Arc::new(builder.finish()))
 }
 
-fn try_as_string_array(arr: &ArrayRef, dtype: &DataType) -> Result<StringArray> {
-    match dtype {
-        DataType::Utf8 => {
-            let a = arr.as_any().downcast_ref::<StringArray>();
-            if let Some(a) = a {
-                Ok(a.clone())
-            } else {
-                Err(DataFusionError::Execution("expected Utf8".into()))
-            }
-        }
-        DataType::LargeUtf8 => {
-            let a64 = arr.as_any().downcast_ref::<GenericStringArray<i64>>();
-            if a64.is_none() {
-                return Err(DataFusionError::Execution("expected LargeUtf8".into()));
-            }
-            let a64 = a64.unwrap();
-            let mut b = StringBuilder::new();
-            for i in 0..a64.len() {
-                if a64.is_null(i) {
-                    b.append_null();
-                } else {
-                    b.append_value(a64.value(i));
-                }
-            }
-            Ok(b.finish())
-        }
-        other => Err(DataFusionError::Execution(format!(
-            "unsupported data type: {other:?}"
-        ))),
-    }
+/// Build a DataFusion scalar UDF that performs Spark-compatible `regexp_extract`.
+#[inline]
+pub fn make_regexp_extract_udf() -> ScalarUDF {
+    let signatures = vec![
+        TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Int32]),
+        TypeSignature::Exact(vec![DataType::Utf8, DataType::LargeUtf8, DataType::Int32]),
+        TypeSignature::Exact(vec![DataType::LargeUtf8, DataType::Utf8, DataType::Int32]),
+        TypeSignature::Exact(vec![
+            DataType::LargeUtf8,
+            DataType::LargeUtf8,
+            DataType::Int32,
+        ]),
+    ];
+
+    let signature = Signature::one_of(signatures, Volatility::Immutable);
+    let fun: ScalarFunctionImplementation =
+        Arc::new(|args: &[ColumnarValue]| regexp_extract_udf_impl(args));
+
+    ScalarUDF::from(SimpleScalarUDF::new_with_signature(
+        "regexp_extract",
+        signature,
+        DataType::Utf8,
+        fun,
+    ))
 }
 
-/// Create and return the Scalar UDF for registration on SessionContext.
-/// Callers invoke via DataFrame/Expr API (no SQL text required).
-pub fn make_regexp_extract_udf() -> datafusion::logical_expr::ScalarUDF {
-    let fun = Arc::new(|args: &[ColumnarValue]| -> Result<ColumnarValue> {
-        if args.len() != 3 {
-            return Err(DataFusionError::Execution(
-                "regexp_extract expects 3 args: (str, pattern, idx)".into(),
+#[inline]
+fn regexp_extract_udf_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    if args.len() != 3 {
+        return Err(DataFusionError::Execution(
+            "regexp_extract expects three arguments".to_string(),
+        ));
+    }
+
+    let result = regexp_extract_kernel(&args[0], &args[1], &args[2])?;
+    Ok(ColumnarValue::Array(result))
+}
+
+#[inline]
+fn all_null_utf8(n: usize) -> ArrayRef {
+    new_null_array(&DataType::Utf8, n)
+}
+
+fn regexp_extract_kernel(
+    str_arg: &ColumnarValue,
+    pat_arg: &ColumnarValue,
+    idx_arg: &ColumnarValue,
+) -> Result<ArrayRef> {
+    let string_input = StringInput::new(str_arg, "str")?;
+    let pattern_input = StringInput::new(pat_arg, "pattern")?;
+    let idx_input = Int32Input::new(idx_arg)?;
+
+    if let Int32Input::Scalar(Some(k)) = idx_input {
+        if k < 0 {
+            return Err(DataFusionError::Plan(
+                "regexp_extract: idx must be >= 0 (negative literal)".to_string(),
             ));
         }
+    }
 
-        // Determine result length with broadcasting rules
-        let len = match (&args[0], &args[1], &args[2]) {
-            (ColumnarValue::Array(a0), ColumnarValue::Array(a1), ColumnarValue::Array(a2)) => {
-                let l = a0.len();
-                if a1.len() != l || a2.len() != l {
-                    return Err(DataFusionError::Execution(
-                        "regexp_extract: array args must have same length".into(),
-                    ));
-                }
-                l
-            }
-            (ColumnarValue::Array(a), _, _) => a.len(),
-            (_, ColumnarValue::Array(a), _) => a.len(),
-            (_, _, ColumnarValue::Array(a)) => a.len(),
-            _ => 1,
-        };
+    let n = string_input
+        .len()
+        .max(pattern_input.len())
+        .max(idx_input.len());
 
-        // Helper to get idx per row
-        fn get_idx_at(args: &[ColumnarValue], i: usize) -> Result<Option<i32>> {
-            match &args[2] {
-                ColumnarValue::Scalar(ScalarValue::Int32(v)) => Ok(*v),
-                ColumnarValue::Array(col) => {
-                    let arr = col
-                        .as_any()
-                        .downcast_ref::<datafusion::arrow::array::Int32Array>()
-                        .ok_or_else(|| DataFusionError::Execution("idx must be Int32".into()))?;
-                    if arr.is_null(i) {
-                        Ok(None)
-                    } else {
-                        Ok(Some(arr.value(i)))
-                    }
-                }
-                _ => Err(DataFusionError::Execution(
-                    "idx must be Int32/Scalar".into(),
-                )),
-            }
-        }
+    if n == 0 {
+        return Ok(all_null_utf8(0));
+    }
 
-        let mut out = StringBuilder::new();
+    if pattern_input.is_scalar_null() || idx_input.is_scalar_null() {
+        return Ok(all_null_utf8(n));
+    }
 
-        // Precompile scalar pattern
-        let scalar_pattern = match &args[1] {
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(p))) => Some(
-                Regex::new(p)
-                    .map_err(|e| DataFusionError::Execution(format!("invalid regex: {e}")))?,
-            ),
-            ColumnarValue::Scalar(ScalarValue::Utf8(None)) => None,
-            _ => None,
-        };
+    let data_capacity = string_input.byte_capacity_hint();
+    let mut builder = StringBuilder::with_capacity(n, data_capacity);
 
-        for i in 0..len {
-            // Null propagation
-            let null_str = match &args[0] {
-                ColumnarValue::Scalar(ScalarValue::Utf8(v)) => v.is_none(),
-                ColumnarValue::Array(a) => match a.data_type() {
-                    DataType::Utf8 => a.as_any().downcast_ref::<StringArray>().unwrap().is_null(i),
-                    DataType::LargeUtf8 => a
-                        .as_any()
-                        .downcast_ref::<GenericStringArray<i64>>()
-                        .unwrap()
-                        .is_null(i),
-                    _ => true,
-                },
-                _ => true,
-            };
-
-            let null_pat = match &args[1] {
-                ColumnarValue::Scalar(ScalarValue::Utf8(v)) => v.is_none(),
-                ColumnarValue::Array(a) => {
-                    let sa = a
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .ok_or_else(|| DataFusionError::Execution("pattern must be Utf8".into()))?;
-                    sa.is_null(i)
-                }
-                _ => true,
-            };
-
-            let null_idx = get_idx_at(args, i)?.is_none();
-
-            if null_str || null_pat || null_idx {
-                out.append_null();
+    if let Some(pattern) = pattern_input.scalar_value() {
+        let regex = compile_regex(pattern)?;
+        for i in 0..n {
+            if string_input.is_null(i) || idx_input.is_null(i) {
+                builder.append_null();
                 continue;
             }
-
-            // Row string
-            let s_val: String = match &args[0] {
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => s.clone(),
-                ColumnarValue::Array(a) => {
-                    let s_arr = try_as_string_array(a, a.data_type())?;
-                    s_arr.value(i).to_string()
-                }
-                _ => unreachable!(),
-            };
-
-            // Regex for this row
-            let re_owned;
-            let re_ref: &Regex = if let Some(re) = &scalar_pattern {
-                re
-            } else {
-                match &args[1] {
-                    ColumnarValue::Array(a) => {
-                        let p_arr = a.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                            DataFusionError::Execution("pattern must be Utf8".into())
-                        })?;
-                        let pat = p_arr.value(i);
-                        re_owned = Regex::new(pat).map_err(|e| {
-                            DataFusionError::Execution(format!("invalid regex: {e}"))
-                        })?;
-                        &re_owned
-                    }
-                    _ => unreachable!(),
-                }
-            };
-
-            // Row idx
-            let idx = get_idx_at(args, i)?.unwrap();
-            if idx < 0 {
-                return Err(DataFusionError::Execution(
-                    "regexp_extract: idx must be >= 0".into(),
-                ));
+            let s = string_input.value_unchecked(i);
+            let idx_value = idx_input.value_unchecked(i);
+            if idx_value < 0 {
+                return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
             }
+            append_capture(&mut builder, s, &regex, idx_value as usize);
+        }
+        return Ok(Arc::new(builder.finish()));
+    }
 
-            // Evaluate
-            if let Some(caps) = re_ref.captures(&s_val) {
-                let out_s = if idx == 0 {
-                    caps.get(0).map(|m| m.as_str()).unwrap_or("")
+    for i in 0..n {
+        if string_input.is_null(i) || pattern_input.is_null(i) || idx_input.is_null(i) {
+            builder.append_null();
+            continue;
+        }
+        let s = string_input.value_unchecked(i);
+        let pattern = pattern_input.value_unchecked(i);
+        let idx_value = idx_input.value_unchecked(i);
+        if idx_value < 0 {
+            return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
+        }
+        let regex = compile_regex(pattern)?;
+        append_capture(&mut builder, s, &regex, idx_value as usize);
+    }
+
+    Ok(Arc::new(builder.finish()))
+}
+
+#[inline]
+fn append_capture(builder: &mut StringBuilder, input: &str, regex: &Regex, idx: usize) {
+    match regex.captures(input) {
+        Some(caps) => {
+            let s = caps.get(idx).map(|m| m.as_str()).unwrap_or("");
+            builder.append_value(s);
+        }
+        None => builder.append_value(""),
+    }
+}
+
+#[inline]
+fn compile_regex(pattern: &str) -> Result<Regex> {
+    Regex::new(pattern).map_err(|err| DataFusionError::Execution(format!("invalid regex: {err}")))
+}
+
+enum StringInput<'a> {
+    Scalar(Option<String>),
+    ArrayUtf8(&'a StringArray),
+    ArrayLargeUtf8(&'a LargeStringArray),
+}
+
+impl<'a> StringInput<'a> {
+    fn new(arg: &'a ColumnarValue, label: &str) -> Result<Self> {
+        match arg {
+            ColumnarValue::Scalar(value) => {
+                if value.is_null() {
+                    return Ok(Self::Scalar(None));
+                }
+                match value {
+                    ScalarValue::Utf8(opt) | ScalarValue::LargeUtf8(opt) => {
+                        Ok(Self::Scalar(opt.clone()))
+                    }
+                    _ => Err(DataFusionError::Execution(format!(
+                        "expected Utf8/LargeUtf8 scalar for {label}"
+                    ))),
+                }
+            }
+            ColumnarValue::Array(array) => {
+                if let Some(utf8) = array.as_any().downcast_ref::<StringArray>() {
+                    Ok(Self::ArrayUtf8(utf8))
+                } else if let Some(large) = array.as_any().downcast_ref::<LargeStringArray>() {
+                    Ok(Self::ArrayLargeUtf8(large))
                 } else {
-                    caps.get(idx as usize).map(|m| m.as_str()).unwrap_or("")
-                };
-                out.append_value(out_s);
-            } else {
-                out.append_value("");
+                    Err(DataFusionError::Execution(format!(
+                        "expected Utf8 or LargeUtf8 array for {label}"
+                    )))
+                }
             }
         }
+    }
 
-        Ok(ColumnarValue::Array(Arc::new(out.finish())))
-    });
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Scalar(_) => 1,
+            Self::ArrayUtf8(arr) => arr.len(),
+            Self::ArrayLargeUtf8(arr) => arr.len(),
+        }
+    }
 
-    create_udf(
-        "regexp_extract",
-        vec![DataType::Utf8, DataType::Utf8, DataType::Int32],
-        DataType::Utf8,
-        Volatility::Immutable,
-        fun,
-    )
+    #[inline]
+    fn is_null(&self, index: usize) -> bool {
+        match self {
+            Self::Scalar(value) => value.is_none(),
+            Self::ArrayUtf8(arr) => arr.is_null(index),
+            Self::ArrayLargeUtf8(arr) => arr.is_null(index),
+        }
+    }
+
+    #[inline]
+    fn scalar_value(&self) -> Option<&str> {
+        match self {
+            Self::Scalar(Some(value)) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn is_scalar_null(&self) -> bool {
+        matches!(self, Self::Scalar(None))
+    }
+
+    #[inline]
+    fn value_unchecked(&self, index: usize) -> &str {
+        match self {
+            Self::Scalar(Some(value)) => value.as_str(),
+            Self::ArrayUtf8(arr) => arr.value(index),
+            Self::ArrayLargeUtf8(arr) => arr.value(index),
+            Self::Scalar(None) => unreachable!("nulls filtered via mask"),
+        }
+    }
+
+    #[inline]
+    fn byte_capacity_hint(&self) -> usize {
+        match self {
+            Self::Scalar(Some(value)) => value.len(),
+            Self::Scalar(None) => 0,
+            Self::ArrayUtf8(arr) => arr.values().len(),
+            Self::ArrayLargeUtf8(arr) => arr.values().len(),
+        }
+    }
+}
+
+enum Int32Input<'a> {
+    Scalar(Option<i32>),
+    Array(&'a Int32Array),
+}
+
+impl<'a> Int32Input<'a> {
+    fn new(arg: &'a ColumnarValue) -> Result<Self> {
+        match arg {
+            ColumnarValue::Scalar(value) => {
+                if value.is_null() {
+                    return Ok(Self::Scalar(None));
+                }
+                match value {
+                    ScalarValue::Int32(opt) => Ok(Self::Scalar(*opt)),
+                    _ => Err(DataFusionError::Execution(
+                        "expected Int32 scalar for idx".to_string(),
+                    )),
+                }
+            }
+            ColumnarValue::Array(array) => {
+                if let Some(ints) = array.as_any().downcast_ref::<Int32Array>() {
+                    Ok(Self::Array(ints))
+                } else {
+                    Err(DataFusionError::Execution(
+                        "expected Int32 array for idx".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Scalar(_) => 1,
+            Self::Array(arr) => arr.len(),
+        }
+    }
+
+    #[inline]
+    fn is_null(&self, index: usize) -> bool {
+        match self {
+            Self::Scalar(value) => value.is_none(),
+            Self::Array(arr) => arr.is_null(index),
+        }
+    }
+
+    #[inline]
+    fn is_scalar_null(&self) -> bool {
+        matches!(self, Self::Scalar(None))
+    }
+
+    #[inline]
+    fn value_unchecked(&self, index: usize) -> i32 {
+        match self {
+            Self::Scalar(Some(value)) => *value,
+            Self::Array(arr) => arr.value(index),
+            Self::Scalar(None) => unreachable!("nulls filtered via mask"),
+        }
+    }
 }

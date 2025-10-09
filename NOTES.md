@@ -1,0 +1,7 @@
+## Notes from observations while reading and writing
+1. The Polars lazy reader is about 10% better if you are reading the data only once. On the second read, the eager reader is three times faster than the lazy reader. This is presumably because the lazy reader filters and pulls only the filtered data from the source, which is not relevant for subsequent queries. In contrast, the eager reader pulls the entire data source, resulting in a very expensive first operation, but from that point onward, everything is loaded and the program does not need to perform further lookups.
+One solution is to add a caching mechanism to lazy loading, which would require changes to the system so it can understand queries at the compiler level, not just at the query level.
+Another option is to rely on common application-level behavior, rather than focusing solely on micro-optimizations for individual queries.
+2. The statement about arrow having zero-copy sharing is incorrect. While it is avoiding marshaling and unmarshaling data, it is still copying the data from the source to the destination between processes or network.
+While this is a significant improvement over the traditional approach of serializing and deserializing data, it is not a zero-copy operation.
+I don't like the tendency to call everything zero-copy when it is not. Direct byte buffers are zero-copy, you read and right to and from them without any additional overhead. with arrow, you copy, like it or not.
