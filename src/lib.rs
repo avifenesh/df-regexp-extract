@@ -126,6 +126,42 @@ impl CompiledRegex {
 }
 
 // ============================================================================
+// CONFIGURATION CONSTANTS
+// ============================================================================
+
+/// LRU cache capacity for column pattern compilation.
+/// Balances memory usage vs cache hit rate for workloads with varying pattern cardinality.
+/// Override with `DF_REGEX_CACHE_SIZE` environment variable.
+fn regex_cache_capacity() -> usize {
+    std::env::var("DF_REGEX_CACHE_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64) // Default: 64 unique patterns per batch
+}
+
+/// Maximum buffer size for zero-copy StringView extraction.
+/// Prevents RSS bloat from pinning huge buffers with low match utilization.
+/// Override with `DF_MAX_ZERO_COPY_BUFFER_MB` environment variable (in megabytes).
+fn max_zero_copy_buffer_size() -> usize {
+    std::env::var("DF_MAX_ZERO_COPY_BUFFER_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(128 * 1024 * 1024) // Default: 128MB
+}
+
+/// Block size for LargeUtf8 buffer coalescing.
+/// Trades off block count vs granularity for zero-copy extraction.
+/// Override with `DF_LARGE_UTF8_BLOCK_SIZE_MB` environment variable (in megabytes).
+fn large_utf8_block_size() -> i64 {
+    std::env::var("DF_LARGE_UTF8_BLOCK_SIZE_MB")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(2 * 1024 * 1024) // Default: 2MB
+}
+
+// ============================================================================
 // PER-BATCH CACHE
 // ============================================================================
 
@@ -139,7 +175,9 @@ impl RegexCache {
     #[inline]
     fn new(capacity: usize) -> Self {
         Self {
-            lru: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
+            lru: LruCache::new(
+                NonZeroUsize::new(capacity).expect("Cache capacity must be non-zero"),
+            ),
         }
     }
 
@@ -176,6 +214,105 @@ fn append_view(
         .try_append_view(block_id, offset, len)
         .map_err(|err| DataFusionError::Execution(format!("regexp_extract: {err}")))?;
     Ok(())
+}
+
+/// Find which block contains a string, using O(1) calculation instead of linear search.
+/// Returns (block_id, offset_in_block) if string is fully contained in one block, None otherwise.
+#[inline]
+fn find_block_for_string(
+    blocks: &[(i64, i64, u32)],
+    block_size: i64,
+    row_start: i64,
+    row_end: i64,
+) -> Option<(u32, u32)> {
+    // Calculate block index directly (O(1) instead of O(n))
+    let block_idx = (row_start / block_size) as usize;
+
+    if block_idx < blocks.len() {
+        let (block_start, block_end, block_id) = blocks[block_idx];
+        // Verify string is fully contained in this block
+        if row_start >= block_start && row_end <= block_end {
+            let offset_in_block = (row_start - block_start) as u32;
+            return Some((block_id, offset_in_block));
+        }
+    }
+
+    None
+}
+
+/// Extract capture group using zero-copy StringView when possible.
+/// Returns true if match was found and extracted, false if no match (caller should append empty string).
+#[inline]
+fn extract_match_zero_copy(
+    regex: &Regex,
+    text: &str,
+    idx_value: i32,
+    row_offset: u32,
+    builder: &mut StringViewBuilder,
+    block_id: u32,
+) -> Result<bool> {
+    if idx_value == 0 {
+        // Fast path: idx=0 returns full match using find()
+        if let Some(m) = regex.find(text) {
+            let offset = row_offset + m.start() as u32;
+            let len = m.len() as u32;
+            append_view(builder, block_id, offset, len)?;
+            return Ok(true);
+        }
+    } else {
+        // Normal path: extract capture group
+        if let Some(caps) = regex.captures(text)
+            && let Some(m) = caps.get(idx_value as usize)
+        {
+            let offset = row_offset + m.start() as u32;
+            let len = m.len() as u32;
+            append_view(builder, block_id, offset, len)?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Extract capture group from PCRE2 regex using zero-copy StringView when possible.
+/// Returns true if match was found and extracted, false if no match (caller should append empty string).
+#[cfg(feature = "pcre2-fallback")]
+#[inline]
+fn extract_match_zero_copy_pcre2(
+    regex: &Pcre2Regex,
+    text: &str,
+    idx_value: i32,
+    row_offset: u32,
+    builder: &mut StringViewBuilder,
+    block_id: u32,
+) -> Result<bool> {
+    let bytes = text.as_bytes();
+
+    if idx_value == 0 {
+        // Fast path: idx=0 returns full match using find()
+        match regex.find(bytes) {
+            Ok(Some(m)) => {
+                let offset = row_offset + m.start() as u32;
+                let len = (m.end() - m.start()) as u32;
+                append_view(builder, block_id, offset, len)?;
+                return Ok(true);
+            }
+            _ => return Ok(false),
+        }
+    } else {
+        // Normal path: extract capture group
+        match regex.captures(bytes) {
+            Ok(Some(caps)) => {
+                if let Some(m) = caps.get(idx_value as usize) {
+                    let offset = row_offset + m.start() as u32;
+                    let len = (m.end() - m.start()) as u32;
+                    append_view(builder, block_id, offset, len)?;
+                    return Ok(true);
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(false)
 }
 
 // ============================================================================
@@ -300,14 +437,14 @@ fn regexp_extract_kernel(
         let compiled = CompiledRegex::new_with_fallback(pattern)?;
 
         // Zero-copy path for Utf8 input (StringArray)
-        if let Some(utf8_arr) = string_input.utf8 {
+        if let ColumnString::Utf8(utf8_arr) = &string_input {
             let values_buffer = utf8_arr.values().clone();
 
             // Retention clamp: avoid pinning huge buffers with low match utilization
-            // If buffer > 128MB, fall back to copying to prevent RSS bloat
-            const MAX_ZERO_COPY_BUFFER_SIZE: usize = 128 * 1024 * 1024; // 128MB
+            // If buffer exceeds threshold, fall back to copying to prevent RSS bloat
+            let max_buffer_size = max_zero_copy_buffer_size();
 
-            if values_buffer.len() <= MAX_ZERO_COPY_BUFFER_SIZE {
+            if values_buffer.len() <= max_buffer_size {
                 // Register input buffer for zero-copy view creation
                 let block_id = builder.append_block(values_buffer);
                 let offsets = utf8_arr.offsets();
@@ -329,28 +466,8 @@ fn regexp_extract_kernel(
                             let s = utf8_arr.value(i);
                             let row_start = offsets[i] as u32;
 
-                            // Fast path: idx=0 returns full match using find()
-                            if idx_value == 0 {
-                                if let Some(m) = regex.find(s) {
-                                    let offset = row_start + m.start() as u32;
-                                    let len = m.len() as u32;
-                                    append_view(&mut builder, block_id, offset, len)?;
-                                } else {
-                                    builder.append_value(""); // Empty on no match
-                                }
-                            } else {
-                                // Normal path: extract capture group
-                                if let Some(caps) = regex.captures(s) {
-                                    if let Some(m) = caps.get(idx_value as usize) {
-                                        let offset = row_start + m.start() as u32;
-                                        let len = m.len() as u32;
-                                        append_view(&mut builder, block_id, offset, len)?;
-                                    } else {
-                                        builder.append_value(""); // Empty if group doesn't exist
-                                    }
-                                } else {
-                                    builder.append_value(""); // Empty on no match
-                                }
+                            if !extract_match_zero_copy(&regex, s, idx_value, row_start, &mut builder, block_id)? {
+                                builder.append_value(""); // Empty on no match
                             }
                         }
                     }
@@ -369,33 +486,10 @@ fn regexp_extract_kernel(
                             }
 
                             let s = utf8_arr.value(i);
-                            let bytes = s.as_bytes();
                             let row_start = offsets[i] as u32;
 
-                            // Fast path: idx=0 returns full match using find()
-                            if idx_value == 0 {
-                                match regex.find(bytes) {
-                                    Ok(Some(m)) => {
-                                        let offset = row_start + m.start() as u32;
-                                        let len = (m.end() - m.start()) as u32;
-                                        append_view(&mut builder, block_id, offset, len)?;
-                                    }
-                                    _ => builder.append_value(""),
-                                }
-                            } else {
-                                // Normal path: extract capture group
-                                match regex.captures(bytes) {
-                                    Ok(Some(caps)) => {
-                                        if let Some(m) = caps.get(idx_value as usize) {
-                                            let offset = row_start + m.start() as u32;
-                                            let len = (m.end() - m.start()) as u32;
-                                            append_view(&mut builder, block_id, offset, len)?;
-                                        } else {
-                                            builder.append_value("");
-                                        }
-                                    }
-                                    _ => builder.append_value(""),
-                                }
+                            if !extract_match_zero_copy_pcre2(&regex, s, idx_value, row_start, &mut builder, block_id)? {
+                                builder.append_value(""); // Empty on no match
                             }
                         }
                     }
@@ -405,9 +499,9 @@ fn regexp_extract_kernel(
             // If buffer > 128MB, fall through to copying path below
         }
 
-        // Zero-copy path for LargeUtf8 input with 2MB block coalescing
-        if let Some(large_utf8_arr) = string_input.large_utf8 {
-            const BLOCK_SIZE: i64 = 2 * 1024 * 1024; // 2MB blocks
+        // Zero-copy path for LargeUtf8 input with block coalescing
+        if let ColumnString::LargeUtf8(large_utf8_arr) = &string_input {
+            let block_size = large_utf8_block_size();
             let values_buffer = large_utf8_arr.values();
             let offsets = large_utf8_arr.offsets();
 
@@ -418,14 +512,14 @@ fn regexp_extract_kernel(
             let mut block_start = 0i64;
 
             while block_start < total_bytes {
-                let block_end = (block_start + BLOCK_SIZE).min(total_bytes);
+                let block_end = (block_start + block_size).min(total_bytes);
                 let block_slice = values_buffer.slice(block_start as usize);
                 let block_id = builder.append_block(block_slice);
                 blocks.push((block_start, block_end, block_id));
                 block_start = block_end;
             }
 
-            match compiled {
+            match &compiled {
                 CompiledRegex::Fast(regex) => {
                     for i in 0..n {
                         if large_utf8_arr.is_null(i) || idx_input.is_null(i) {
@@ -441,47 +535,17 @@ fn regexp_extract_kernel(
                         let row_start = offsets[i];
                         let row_end = offsets[i + 1];
 
-                        // Find which block(s) this string spans
-                        // For simplicity, if string spans multiple blocks, copy it
-                        let mut block_id_opt = None;
-                        let mut offset_in_block = 0u32;
-
-                        for &(block_start, block_end, block_id) in &blocks {
-                            if row_start >= block_start && row_end <= block_end {
-                                // String is fully contained in this block
-                                block_id_opt = Some(block_id);
-                                offset_in_block = (row_start - block_start) as u32;
-                                break;
-                            }
-                        }
-
-                        if let Some(block_id) = block_id_opt {
+                        // Find which block this string is in (O(1) calculation)
+                        if let Some((block_id, offset_in_block)) =
+                            find_block_for_string(&blocks, block_size, row_start, row_end)
+                        {
                             // Zero-copy path: string is in one block
-                            if idx_value == 0 {
-                                if let Some(m) = regex.find(s) {
-                                    let offset = offset_in_block + m.start() as u32;
-                                    let len = m.len() as u32;
-                                    append_view(&mut builder, block_id, offset, len)?;
-                                } else {
-                                    builder.append_value("");
-                                }
-                            } else if let Some(caps) = regex.captures(s) {
-                                if let Some(m) = caps.get(idx_value as usize) {
-                                    let offset = offset_in_block + m.start() as u32;
-                                    let len = m.len() as u32;
-                                    append_view(&mut builder, block_id, offset, len)?;
-                                } else {
-                                    builder.append_value("");
-                                }
-                            } else {
+                            if !extract_match_zero_copy(regex, s, idx_value, offset_in_block, &mut builder, block_id)? {
                                 builder.append_value("");
                             }
                         } else {
                             // Fallback: string spans multiple blocks, copy it
-                            let capture = regex
-                                .captures(s)
-                                .and_then(|caps| caps.get(idx_value as usize).map(|m| m.as_str()))
-                                .unwrap_or("");
+                            let capture = compiled.get_capture(s, idx_value as usize);
                             builder.append_value(capture);
                         }
                     }
@@ -499,56 +563,20 @@ fn regexp_extract_kernel(
                         }
 
                         let s = large_utf8_arr.value(i);
-                        let bytes = s.as_bytes();
                         let row_start = offsets[i];
                         let row_end = offsets[i + 1];
 
-                        // Find which block this string is in
-                        let mut block_id_opt = None;
-                        let mut offset_in_block = 0u32;
-
-                        for &(block_start, block_end, block_id) in &blocks {
-                            if row_start >= block_start && row_end <= block_end {
-                                block_id_opt = Some(block_id);
-                                offset_in_block = (row_start - block_start) as u32;
-                                break;
-                            }
-                        }
-
-                        if let Some(block_id) = block_id_opt {
+                        // Find which block this string is in (O(1) calculation)
+                        if let Some((block_id, offset_in_block)) =
+                            find_block_for_string(&blocks, block_size, row_start, row_end)
+                        {
                             // Zero-copy path
-                            if idx_value == 0 {
-                                match regex.find(bytes) {
-                                    Ok(Some(m)) => {
-                                        let offset = offset_in_block + m.start() as u32;
-                                        let len = (m.end() - m.start()) as u32;
-                                        append_view(&mut builder, block_id, offset, len)?;
-                                    }
-                                    _ => builder.append_value(""),
-                                }
-                            } else {
-                                match regex.captures(bytes) {
-                                    Ok(Some(caps)) => {
-                                        if let Some(m) = caps.get(idx_value as usize) {
-                                            let offset = offset_in_block + m.start() as u32;
-                                            let len = (m.end() - m.start()) as u32;
-                                            append_view(&mut builder, block_id, offset, len)?;
-                                        } else {
-                                            builder.append_value("");
-                                        }
-                                    }
-                                    _ => builder.append_value(""),
-                                }
+                            if !extract_match_zero_copy_pcre2(regex, s, idx_value, offset_in_block, &mut builder, block_id)? {
+                                builder.append_value("");
                             }
                         } else {
                             // Fallback: string spans blocks, copy it
-                            let capture = match regex.captures(bytes) {
-                                Ok(Some(caps)) => match caps.get(idx_value as usize) {
-                                    Some(m) => &s[m.start()..m.end()],
-                                    None => "",
-                                },
-                                _ => "",
-                            };
+                            let capture = compiled.get_capture(s, idx_value as usize);
                             builder.append_value(capture);
                         }
                     }
@@ -558,66 +586,33 @@ fn regexp_extract_kernel(
         }
 
         // Fallback: copying path for Utf8View and scalar inputs
-        match compiled {
-            CompiledRegex::Fast(regex) => {
-                for i in 0..n {
-                    if string_input.is_null(i) || idx_input.is_null(i) {
-                        builder.append_null();
-                        continue;
-                    }
-                    let s = string_input.value_unchecked(i);
-                    let idx_value = idx_input.value_unchecked(i);
-                    if idx_value < 0 {
-                        return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
-                    }
-                    let capture = regex
-                        .captures(s)
-                        .and_then(|caps| caps.get(idx_value as usize).map(|m| m.as_str()))
-                        .unwrap_or("");
-                    builder.append_value(capture);
-                }
+        for i in 0..n {
+            if string_input.is_null(i) || idx_input.is_null(i) {
+                builder.append_null();
+                continue;
             }
-            #[cfg(feature = "pcre2-fallback")]
-            CompiledRegex::Pcre2(regex) => {
-                for i in 0..n {
-                    if string_input.is_null(i) || idx_input.is_null(i) {
-                        builder.append_null();
-                        continue;
-                    }
-                    let s = string_input.value_unchecked(i);
-                    let idx_value = idx_input.value_unchecked(i);
-                    if idx_value < 0 {
-                        return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
-                    }
-                    let bytes = s.as_bytes();
-                    let capture = match regex.captures(bytes) {
-                        Ok(Some(caps)) => {
-                            // Map PCRE2 byte offsets into the original string
-                            match caps.get(idx_value as usize) {
-                                Some(m) => &s[m.start()..m.end()],
-                                None => "",
-                            }
-                        }
-                        _ => "",
-                    };
-                    builder.append_value(capture);
-                }
+            let s = string_input.value_unchecked(i);
+            let idx_value = idx_input.value_unchecked(i);
+            if idx_value < 0 {
+                return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
             }
+            let capture = compiled.get_capture(s, idx_value as usize);
+            builder.append_value(capture);
         }
         return Ok(Arc::new(builder.finish()));
     }
 
     // Column patterns: use an LRU cache to limit recompilation
-    let mut cache = RegexCache::new(64); // Batch-scoped cache
+    let mut cache = RegexCache::new(regex_cache_capacity());
 
     // Zero-copy path for Utf8 input (StringArray)
-    if let Some(utf8_arr) = string_input.utf8 {
+    if let ColumnString::Utf8(utf8_arr) = &string_input {
         let values_buffer = utf8_arr.values().clone();
 
-        // Retention clamp: same 128MB threshold as scalar pattern path
-        const MAX_ZERO_COPY_BUFFER_SIZE: usize = 128 * 1024 * 1024;
+        // Retention clamp: same threshold as scalar pattern path
+        let max_buffer_size = max_zero_copy_buffer_size();
 
-        if values_buffer.len() <= MAX_ZERO_COPY_BUFFER_SIZE {
+        if values_buffer.len() <= max_buffer_size {
             let block_id = builder.append_block(values_buffer);
             let offsets = utf8_arr.offsets();
 
@@ -636,60 +631,19 @@ fn regexp_extract_kernel(
                 let row_start = offsets[i] as u32;
                 let regex = cache.get_or_insert(pattern)?;
 
-                // Need to handle Fast and PCRE2 separately to get offsets
-                match &regex {
+                // Extract using appropriate engine
+                let matched = match &regex {
                     CompiledRegex::Fast(r) => {
-                        if idx_value == 0 {
-                            // Fast path: idx=0 uses find()
-                            if let Some(m) = r.find(s) {
-                                let offset = row_start + m.start() as u32;
-                                let len = m.len() as u32;
-                                append_view(&mut builder, block_id, offset, len)?;
-                            } else {
-                                builder.append_value("");
-                            }
-                        } else {
-                            // Normal path: extract capture group
-                            if let Some(caps) = r.captures(s) {
-                                if let Some(m) = caps.get(idx_value as usize) {
-                                    let offset = row_start + m.start() as u32;
-                                    let len = m.len() as u32;
-                                    append_view(&mut builder, block_id, offset, len)?;
-                                } else {
-                                    builder.append_value("");
-                                }
-                            } else {
-                                builder.append_value("");
-                            }
-                        }
+                        extract_match_zero_copy(r, s, idx_value, row_start, &mut builder, block_id)?
                     }
                     #[cfg(feature = "pcre2-fallback")]
                     CompiledRegex::Pcre2(r) => {
-                        let bytes = s.as_bytes();
-                        if idx_value == 0 {
-                            match r.find(bytes) {
-                                Ok(Some(m)) => {
-                                    let offset = row_start + m.start() as u32;
-                                    let len = (m.end() - m.start()) as u32;
-                                    append_view(&mut builder, block_id, offset, len)?;
-                                }
-                                _ => builder.append_value(""),
-                            }
-                        } else {
-                            match r.captures(bytes) {
-                                Ok(Some(caps)) => {
-                                    if let Some(m) = caps.get(idx_value as usize) {
-                                        let offset = row_start + m.start() as u32;
-                                        let len = (m.end() - m.start()) as u32;
-                                        append_view(&mut builder, block_id, offset, len)?;
-                                    } else {
-                                        builder.append_value("");
-                                    }
-                                }
-                                _ => builder.append_value(""),
-                            }
-                        }
+                        extract_match_zero_copy_pcre2(r, s, idx_value, row_start, &mut builder, block_id)?
                     }
+                };
+
+                if !matched {
+                    builder.append_value("");
                 }
             }
             return Ok(Arc::new(builder.finish()));
@@ -698,8 +652,8 @@ fn regexp_extract_kernel(
     }
 
     // Zero-copy path for LargeUtf8 input with column patterns
-    if let Some(large_utf8_arr) = string_input.large_utf8 {
-        const BLOCK_SIZE: i64 = 2 * 1024 * 1024; // 2MB blocks
+    if let ColumnString::LargeUtf8(large_utf8_arr) = &string_input {
+        let block_size = large_utf8_block_size();
         let values_buffer = large_utf8_arr.values();
         let offsets = large_utf8_arr.offsets();
 
@@ -709,7 +663,7 @@ fn regexp_extract_kernel(
         let mut block_start = 0i64;
 
         while block_start < total_bytes {
-            let block_end = (block_start + BLOCK_SIZE).min(total_bytes);
+            let block_end = (block_start + block_size).min(total_bytes);
             let block_slice = values_buffer.slice(block_start as usize);
             let block_id = builder.append_block(block_slice);
             blocks.push((block_start, block_end, block_id));
@@ -732,69 +686,23 @@ fn regexp_extract_kernel(
             let row_end = offsets[i + 1];
             let regex = cache.get_or_insert(pattern)?;
 
-            // Find which block this string is in
-            let mut block_id_opt = None;
-            let mut offset_in_block = 0u32;
-
-            for &(block_start, block_end, block_id) in &blocks {
-                if row_start >= block_start && row_end <= block_end {
-                    block_id_opt = Some(block_id);
-                    offset_in_block = (row_start - block_start) as u32;
-                    break;
-                }
-            }
-
-            if let Some(block_id) = block_id_opt {
+            // Find which block this string is in (O(1) calculation)
+            if let Some((block_id, offset_in_block)) =
+                find_block_for_string(&blocks, block_size, row_start, row_end)
+            {
                 // Zero-copy path
-                match &regex {
+                let matched = match &regex {
                     CompiledRegex::Fast(r) => {
-                        if idx_value == 0 {
-                            if let Some(m) = r.find(s) {
-                                let offset = offset_in_block + m.start() as u32;
-                                let len = m.len() as u32;
-                                append_view(&mut builder, block_id, offset, len)?;
-                            } else {
-                                builder.append_value("");
-                            }
-                        } else if let Some(caps) = r.captures(s) {
-                            if let Some(m) = caps.get(idx_value as usize) {
-                                let offset = offset_in_block + m.start() as u32;
-                                let len = m.len() as u32;
-                                append_view(&mut builder, block_id, offset, len)?;
-                            } else {
-                                builder.append_value("");
-                            }
-                        } else {
-                            builder.append_value("");
-                        }
+                        extract_match_zero_copy(r, s, idx_value, offset_in_block, &mut builder, block_id)?
                     }
                     #[cfg(feature = "pcre2-fallback")]
                     CompiledRegex::Pcre2(r) => {
-                        let bytes = s.as_bytes();
-                        if idx_value == 0 {
-                            match r.find(bytes) {
-                                Ok(Some(m)) => {
-                                    let offset = offset_in_block + m.start() as u32;
-                                    let len = (m.end() - m.start()) as u32;
-                                    append_view(&mut builder, block_id, offset, len)?;
-                                }
-                                _ => builder.append_value(""),
-                            }
-                        } else {
-                            match r.captures(bytes) {
-                                Ok(Some(caps)) => {
-                                    if let Some(m) = caps.get(idx_value as usize) {
-                                        let offset = offset_in_block + m.start() as u32;
-                                        let len = (m.end() - m.start()) as u32;
-                                        append_view(&mut builder, block_id, offset, len)?;
-                                    } else {
-                                        builder.append_value("");
-                                    }
-                                }
-                                _ => builder.append_value(""),
-                            }
-                        }
+                        extract_match_zero_copy_pcre2(r, s, idx_value, offset_in_block, &mut builder, block_id)?
                     }
+                };
+
+                if !matched {
+                    builder.append_value("");
                 }
             } else {
                 // Fallback: string spans blocks, copy it
@@ -913,11 +821,16 @@ type Int32Input<'a> = Input<'a, i32, Int32Array>;
 // INPUT HELPERS: String (Utf8/LargeUtf8/Scalar)
 // ============================================================================
 
-struct ColumnString<'a> {
-    scalar: Option<Option<String>>,
-    utf8: Option<&'a StringArray>,
-    large_utf8: Option<&'a LargeStringArray>,
-    utf8_view: Option<&'a StringViewArray>,
+/// Represents a string input that can be either a scalar value or an array column.
+enum ColumnString<'a> {
+    /// Scalar string value (may be null)
+    Scalar(Option<String>),
+    /// Reference to a Utf8 (StringArray) column
+    Utf8(&'a StringArray),
+    /// Reference to a LargeUtf8 column
+    LargeUtf8(&'a LargeStringArray),
+    /// Reference to a Utf8View column
+    Utf8View(&'a StringViewArray),
 }
 
 impl<'a> ColumnString<'a> {
@@ -925,26 +838,13 @@ impl<'a> ColumnString<'a> {
         match arg {
             ColumnarValue::Scalar(value) => {
                 if value.is_null() {
-                    Ok(Self {
-                        scalar: Some(None),
-                        utf8: None,
-                        large_utf8: None,
-                        utf8_view: None,
-                    })
+                    Ok(Self::Scalar(None))
                 } else {
                     match value {
-                        ScalarValue::Utf8(opt) | ScalarValue::LargeUtf8(opt) => Ok(Self {
-                            scalar: Some(opt.clone()),
-                            utf8: None,
-                            large_utf8: None,
-                            utf8_view: None,
-                        }),
-                        ScalarValue::Utf8View(opt) => Ok(Self {
-                            scalar: Some(opt.clone()),
-                            utf8: None,
-                            large_utf8: None,
-                            utf8_view: None,
-                        }),
+                        ScalarValue::Utf8(opt) | ScalarValue::LargeUtf8(opt) => {
+                            Ok(Self::Scalar(opt.clone()))
+                        }
+                        ScalarValue::Utf8View(opt) => Ok(Self::Scalar(opt.clone())),
                         _ => Err(DataFusionError::Execution(format!(
                             "expected Utf8/LargeUtf8/Utf8View scalar for {label}"
                         ))),
@@ -953,26 +853,11 @@ impl<'a> ColumnString<'a> {
             }
             ColumnarValue::Array(array) => {
                 if let Some(utf8) = array.as_any().downcast_ref::<StringArray>() {
-                    Ok(Self {
-                        scalar: None,
-                        utf8: Some(utf8),
-                        large_utf8: None,
-                        utf8_view: None,
-                    })
+                    Ok(Self::Utf8(utf8))
                 } else if let Some(large) = array.as_any().downcast_ref::<LargeStringArray>() {
-                    Ok(Self {
-                        scalar: None,
-                        utf8: None,
-                        large_utf8: Some(large),
-                        utf8_view: None,
-                    })
+                    Ok(Self::LargeUtf8(large))
                 } else if let Some(utf8_view) = array.as_any().downcast_ref::<StringViewArray>() {
-                    Ok(Self {
-                        scalar: None,
-                        utf8: None,
-                        large_utf8: None,
-                        utf8_view: Some(utf8_view),
-                    })
+                    Ok(Self::Utf8View(utf8_view))
                 } else {
                     Err(DataFusionError::Execution(format!(
                         "expected Utf8 or LargeUtf8 or Utf8View array for {label}"
@@ -984,56 +869,45 @@ impl<'a> ColumnString<'a> {
 
     #[inline(always)]
     fn len(&self) -> usize {
-        if self.scalar.is_some() {
-            1
-        } else if let Some(arr) = self.utf8 {
-            arr.len()
-        } else if let Some(arr) = self.large_utf8 {
-            arr.len()
-        } else if let Some(arr) = self.utf8_view {
-            arr.len()
-        } else {
-            0
+        match self {
+            Self::Scalar(_) => 1,
+            Self::Utf8(arr) => arr.len(),
+            Self::LargeUtf8(arr) => arr.len(),
+            Self::Utf8View(arr) => arr.len(),
         }
     }
 
     #[inline(always)]
     fn is_null(&self, index: usize) -> bool {
-        if let Some(value) = &self.scalar {
-            value.is_none()
-        } else if let Some(arr) = self.utf8 {
-            arr.is_null(index)
-        } else if let Some(arr) = self.large_utf8 {
-            arr.is_null(index)
-        } else if let Some(arr) = self.utf8_view {
-            arr.is_null(index)
-        } else {
-            true
+        match self {
+            Self::Scalar(opt) => opt.is_none(),
+            Self::Utf8(arr) => arr.is_null(index),
+            Self::LargeUtf8(arr) => arr.is_null(index),
+            Self::Utf8View(arr) => arr.is_null(index),
         }
     }
 
     #[inline(always)]
     fn scalar_value(&self) -> Option<&str> {
-        self.scalar.as_ref().and_then(|opt| opt.as_deref())
+        match self {
+            Self::Scalar(Some(s)) => Some(s),
+            _ => None,
+        }
     }
 
     #[inline(always)]
     fn is_scalar_null(&self) -> bool {
-        matches!(self.scalar, Some(None))
+        matches!(self, Self::Scalar(None))
     }
 
     #[inline(always)]
     fn value_unchecked(&self, index: usize) -> &str {
-        if let Some(Some(value)) = self.scalar.as_ref() {
-            value
-        } else if let Some(arr) = self.utf8 {
-            arr.value(index)
-        } else if let Some(arr) = self.large_utf8 {
-            arr.value(index)
-        } else if let Some(arr) = self.utf8_view {
-            arr.value(index)
-        } else {
-            unreachable!("string input must be scalar or array")
+        match self {
+            Self::Scalar(Some(value)) => value,
+            Self::Utf8(arr) => arr.value(index),
+            Self::LargeUtf8(arr) => arr.value(index),
+            Self::Utf8View(arr) => arr.value(index),
+            Self::Scalar(None) => unreachable!("null filtered via mask"),
         }
     }
 }

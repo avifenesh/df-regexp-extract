@@ -266,3 +266,10 @@ Since it a must have feature, it is worth the extra complexity. (Must by the rul
 Those results are expected, the idea of creating additional pointer/view is worth doing when the overhead worth it, and in small values this is not the case.
 Since we are working with big data systems, and we are in the world of arrow, the zero copy is worth the extra complexity.
 In the key-val world this would require more fine tuning and fences.
+
+----
+### v0.6 - added after sent 
+- move extract match for zero copy to a mutual use function, cleaner code.
+- Extract magic numbers to constants, made some env configurable.
+- improve the search for text block to O(1) instead of O(n)
+rewrite from struct to enum for the different input types, and the different output types.
