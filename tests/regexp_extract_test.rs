@@ -42,21 +42,34 @@ async fn run_extract(
         .select(vec![call_expr.alias("g")])
         .unwrap();
     let batches = df.collect().await?;
-    let col = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let col = batches[0].column(0);
 
-    Ok((0..col.len())
-        .map(|i| {
-            if col.is_null(i) {
-                None
-            } else {
-                Some(col.value(i).to_string())
-            }
-        })
-        .collect())
+    // Handle both StringArray (Utf8) and StringViewArray (Utf8View)
+    use datafusion::arrow::array::StringViewArray;
+
+    if let Some(str_array) = col.as_any().downcast_ref::<StringArray>() {
+        Ok((0..str_array.len())
+            .map(|i| {
+                if str_array.is_null(i) {
+                    None
+                } else {
+                    Some(str_array.value(i).to_string())
+                }
+            })
+            .collect())
+    } else if let Some(view_array) = col.as_any().downcast_ref::<StringViewArray>() {
+        Ok((0..view_array.len())
+            .map(|i| {
+                if view_array.is_null(i) {
+                    None
+                } else {
+                    Some(view_array.value(i).to_string())
+                }
+            })
+            .collect())
+    } else {
+        panic!("Expected StringArray or StringViewArray, got {:?}", col.data_type());
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -501,4 +514,65 @@ async fn idx_negative_errors() {
         .await
         .unwrap_err();
     assert!(format!("{err}").contains("idx must be >= 0"));
+}
+
+// ============================================================================
+// SEMANTICS PARITY TESTS: Explicit edge case behavior
+// ============================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn semantics_null_input_returns_null() {
+    let result = run_extract(vec![None], "\\d+", Some(1)).await.unwrap();
+    assert_eq!(result, vec![None]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn semantics_no_match_returns_empty_string() {
+    let result = run_extract(vec![Some("abcdef")], "\\d+", Some(1))
+        .await
+        .unwrap();
+    assert_eq!(result, vec![Some("".to_string())]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn semantics_missing_group_returns_empty_string() {
+    // Pattern has 1 group, ask for group 5
+    let result = run_extract(vec![Some("foo123")], "(\\d+)", Some(5))
+        .await
+        .unwrap();
+    assert_eq!(result, vec![Some("".to_string())]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn semantics_index_0_returns_full_match() {
+    // idx=0 should return full match, not a capture group
+    let result = run_extract(vec![Some("foo123bar")], "\\d+", Some(0))
+        .await
+        .unwrap();
+    assert_eq!(result, vec![Some("123".to_string())]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn semantics_index_0_with_groups_returns_full_match() {
+    // Even with capture groups, idx=0 returns full match
+    let result = run_extract(vec![Some("foo123bar")], "f(o+)(\\d+)b", Some(0))
+        .await
+        .unwrap();
+    assert_eq!(result, vec![Some("foo123b".to_string())]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn semantics_index_1_returns_first_group() {
+    let result = run_extract(vec![Some("foo123bar")], "f(o+)(\\d+)b", Some(1))
+        .await
+        .unwrap();
+    assert_eq!(result, vec![Some("oo".to_string())]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn semantics_index_2_returns_second_group() {
+    let result = run_extract(vec![Some("foo123bar")], "f(o+)(\\d+)b", Some(2))
+        .await
+        .unwrap();
+    assert_eq!(result, vec![Some("123".to_string())]);
 }

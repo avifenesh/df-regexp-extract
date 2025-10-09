@@ -137,9 +137,11 @@ fn generate_pattern_column(size: usize, unique_patterns: usize) -> Vec<String> {
 /// Benchmark: Scalar pattern with scalar idx (baseline - Step 1)
 fn bench_scalar_pattern_various_sizes(c: &mut Criterion) {
     let mut group = c.benchmark_group("scalar_pattern");
-    group.sample_size(20); // Fast iteration: 20 samples instead of 100
 
     for size in [10_000, 100_000].iter() {
+        // Increase samples for larger datasets
+        group.sample_size(if *size >= 100_000 { 75 } else { 20 });
+
         let arr = generate_plan_v1_dataset(*size, 0.8);
         let re = Regex::new(r"(\w+)-(\d+)").unwrap();
 
@@ -391,10 +393,12 @@ fn bench_edge_cases(c: &mut Criterion) {
 /// Benchmark: Batch sizes (8K, 64K)
 fn bench_batch_sizes(c: &mut Criterion) {
     let mut group = c.benchmark_group("batch_sizes");
-    group.sample_size(20);
     let re = Regex::new(r"(\w+)-(\d+)").unwrap();
 
     for batch_size in [8_192, 65_536].iter() {
+        // Increase samples for 64K batch
+        group.sample_size(if *batch_size >= 65_536 { 55 } else { 20 });
+
         let arr = generate_plan_v1_dataset(*batch_size, 0.8);
 
         group.throughput(Throughput::Elements(*batch_size as u64));
@@ -418,11 +422,14 @@ fn bench_batch_sizes(c: &mut Criterion) {
 /// Tests per-row regex compilation overhead - KEY for measuring Step-4 LRU improvements
 fn bench_column_pattern_cardinality(c: &mut Criterion) {
     let mut group = c.benchmark_group("column_pattern_cardinality");
-    group.sample_size(10); // Even fewer samples - this is expensive
+    group.sample_size(55); // Increased for reliable measurements
     let size = 10_000;
 
     // Create tokio runtime for async UDF execution
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
     for (name, unique_count) in [("low_4", 4), ("high_10k", size)].iter() {
         // Generate data and pattern column

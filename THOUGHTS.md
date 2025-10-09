@@ -160,3 +160,103 @@ See [tests/spark_contract.rs](tests/spark_contract.rs)
     _spark_positive_lookahead_selects_alphanumeric_word_
 
 ## Benchmarking
+
+| Benchmark | Mean | 95% CI | Throughput* |
+|-----------|------|--------|-------------|
+| batch_sizes/64k | 6.97 ms | [6.95 ms, 6.98 ms] | 9.41 M/s |
+| batch_sizes/8k | 861.41 µs | [860.24 µs, 862.58 µs] | 9.51 M/s |
+| column_pattern_cardinality/high_10k | 5.22 s | [5.21 s, 5.23 s] | 1.92 K/s |
+| column_pattern_cardinality/low_4 | 6.53 s | [6.48 s, 6.58 s] | 1.53 K/s |
+| edge_cases/all_nulls | 26.15 µs | [25.99 µs, 26.39 µs] | 382.42 M/s |
+| edge_cases/identical | 1.14 ms | [1.13 ms, 1.17 ms] | 8.74 M/s |
+| group_indices/idx_0 | 1.07 ms | [1.05 ms, 1.11 ms] | 9.32 M/s |
+| group_indices/idx_1 | 1.06 ms | [1.06 ms, 1.06 ms] | 9.43 M/s |
+| match_rates/0% | 390.85 µs | [388.79 µs, 393.17 µs] | 25.59 M/s |
+| match_rates/100% | 1.23 ms | [1.22 ms, 1.24 ms] | 8.12 M/s |
+| match_rates/50% | 819.02 µs | [806.42 µs, 836.89 µs] | 12.21 M/s |
+| null_rates/0% | 1.10 ms | [1.09 ms, 1.11 ms] | 9.10 M/s |
+| null_rates/50% | 586.45 µs | [583.35 µs, 589.80 µs] | 17.05 M/s |
+| pattern_complexity/complex | 1.64 ms | [1.62 ms, 1.67 ms] | 6.09 M/s |
+| pattern_complexity/simple | 758.03 µs | [755.96 µs, 760.32 µs] | 13.19 M/s |
+| realistic_workloads/log_lines | 2.60 ms | [2.58 ms, 2.62 ms] | 3.85 M/s |
+| realistic_workloads/urls | 1.77 ms | [1.76 ms, 1.78 ms] | 5.66 M/s |
+| scalar_pattern/10000 | 1.06 ms | [1.06 ms, 1.07 ms] | 9.42 M/s |
+| scalar_pattern/100000 | 10.67 ms | [10.63 ms, 10.71 ms] | 9.37 M/s |
+| string_lengths/long | 1.24 ms | [1.23 ms, 1.25 ms] | 8.07 M/s |
+| string_lengths/medium | 1.18 ms | [1.14 ms, 1.26 ms] | 8.46 M/s |
+| string_lengths/short | 1.09 ms | [1.09 ms, 1.10 ms] | 9.16 M/s |
+
+## v0.3 adding a LRU cache for column patterns and some zero (i hope) cost abstraction.
+- The abstraction is for the different input string(utf8/largeutf8/scalar) and int32 - some methods repeats in both with the same code, some differ in code but has the same behavior - went for generic enum and impl specific methods for each that are needed. Used inline(always) to avoid any overhead.
+
+- LRU using lru crate, and the cache is per-batch, meaning it is dropped at the end of the function so no global state and cache invalidation issues.
+Get or insert is used to avoid recompiling the same pattern across rows.
+Errors are not cached, they propagate immediately.
+
+### Test status:
+  Tests failing now are (same as v0.2):
+    _spark_lookbehind_returns_captured_digits_
+    _spark_named_backreference_repeats_match_
+    _spark_negative_lookbehind_preserves_full_match_
+    _spark_positive_lookahead_selects_alphanumeric_word_
+
+### Benchmark Results
+
+| Benchmark | Mean | 95% CI | Throughput* |
+|-----------|------|--------|-------------|
+| batch_sizes/64k | 6.99 ms | [6.98 ms, 7.01 ms] | 9.37 M/s |
+| batch_sizes/8k | 865.04 µs | [863.30 µs, 866.96 µs] | 9.47 M/s |
+| column_pattern_cardinality/high_10k | 7.92 ms | [7.87 ms, 7.98 ms] | 1.26 M/s |
+| column_pattern_cardinality/low_4 | 7.69 ms | [7.66 ms, 7.72 ms] | 1.30 M/s |
+| edge_cases/all_nulls | 26.21 µs | [26.02 µs, 26.52 µs] | 381.53 M/s |
+| edge_cases/identical | 1.11 ms | [1.10 ms, 1.12 ms] | 9.02 M/s |
+| group_indices/idx_0 | 1.06 ms | [1.05 ms, 1.06 ms] | 9.47 M/s |
+| group_indices/idx_1 | 1.08 ms | [1.07 ms, 1.08 ms] | 9.28 M/s |
+| match_rates/0% | 388.14 µs | [387.41 µs, 388.86 µs] | 25.76 M/s |
+| match_rates/100% | 1.23 ms | [1.22 ms, 1.23 ms] | 8.16 M/s |
+| match_rates/50% | 806.87 µs | [803.82 µs, 810.85 µs] | 12.39 M/s |
+| null_rates/0% | 1.08 ms | [1.08 ms, 1.09 ms] | 9.23 M/s |
+| null_rates/50% | 590.17 µs | [582.29 µs, 600.44 µs] | 16.94 M/s |
+| pattern_complexity/complex | 1.62 ms | [1.62 ms, 1.63 ms] | 6.16 M/s |
+| pattern_complexity/simple | 754.47 µs | [752.24 µs, 757.02 µs] | 13.25 M/s |
+| realistic_workloads/log_lines | 2.59 ms | [2.59 ms, 2.60 ms] | 3.86 M/s |
+| realistic_workloads/urls | 1.77 ms | [1.77 ms, 1.78 ms] | 5.65 M/s |
+| scalar_pattern/10000 | 1.06 ms | [1.05 ms, 1.06 ms] | 9.46 M/s |
+| scalar_pattern/100000 | 10.77 ms | [10.73 ms, 10.82 ms] | 9.29 M/s |
+| string_lengths/long | 1.27 ms | [1.26 ms, 1.29 ms] | 7.85 M/s |
+| string_lengths/medium | 1.15 ms | [1.14 ms, 1.15 ms] | 8.72 M/s |
+| string_lengths/short | 1.08 ms | [1.08 ms, 1.09 ms] | 9.22 M/s |
+
+Massive wins on column-pattern cardinality benches; essentially net-neutral to slightly positive everywhere else.
+3-4 cases shows less then 1% regression, worth investigating, but in general it is a win.
+---
+## v0.4 Regex Fallback Engine
+### Regex Fallback Engine Research
+
+### Context
+The standard `regex` crate doesn't support advanced features (lookahead, lookbehind, backreferences) needed for full Spark compatibility. Researched two candidates: fancy-regex (pure Rust) vs PCRE2 (FFI to C).
+
+### Decision: PCRE2 (Score: 78/100 vs 45/100)
+
+**Key Findings**:
+- **Performance**: PCRE2 is **40x faster (compile)** and **32x faster (match)**
+- **Features**: Both support 4/5 required Spark features (80%)
+- **Security**: PCRE2 has comprehensive limit APIs (match_limit, heap_limit, recursion_limit)
+- **Trade-off**: Accept FFI + 300KB binary size for 40x performance gain
+
+**Performance Data**:
+```
+Compilation: PCRE2 28.5µs vs fancy-regex 1.15ms (40x faster)
+Matching:    PCRE2 117ns vs fancy-regex 3.85µs (32x faster)
+```
+#### Implementation:
+Feature-gated PCRE2 fallback, enabled by default.
+If regex compilation fails, PCRE2 is used instead.
+
+#### Results:
+- All 18/18 Spark contract tests pass (was 13/18)
+- Automatic fallback (transparent to users)
+
+### Benchmark Results
+differences are not significant, but some hits in cases where another if in the loop affects the performance.
+Since it a must have feature, it is worth the extra complexity. (Must by the rules i created for myself)

@@ -516,13 +516,13 @@ async fn spark_negative_lookahead_filters_prefix() {
     let ctx = SessionContext::new();
     ctx.register_udf(make_regexp_extract_udf());
 
+    // Negative lookahead: (?!foo) matches where "foo" does NOT follow
+    // At position 1 (after 'f'), lookahead sees "oob" (not "foo") → matches
+    // Then (.*) captures "oobaz"
     let df = ctx
         .sql("SELECT regexp_extract('foobaz', '(?!foo)(.*)', CAST(1 AS INT)) AS g")
         .await
         .unwrap();
-    let err = df.collect().await.unwrap_err();
-    assert!(
-        err.to_string().contains("look-around"),
-        "expected look-around error, got {err}"
-    );
+    let out = df.collect().await.unwrap();
+    assert_string_column(out, &["oobaz"]);
 }

@@ -5,18 +5,32 @@ edition = "2024"
 license = "Apache-2.0"
 authors = ["Avi Fenesh aviarchi1994@gmail.com"]
 description = "DataFusion Scalar UDF: Spark-compatible regexp_extract (no SQL API)."
+autobins = false
+autobenches = false
 
 [lib]
 name = "df_regexp_extract"
 path = "src/lib.rs"
 
+[[bin]]
+name = "generate_csv_data"
+path = "src/bin/generate_csv_data.rs"
+test = false
+bench = false
+
 [dependencies]
-datafusion = "50.1"
+datafusion = { version = "50.1", default-features = false, features = ["regex_expressions", "unicode_expressions"] }
 regex = "1.10"
-tokio = { version = "1", features = ["full"] }
+lru = "0.16"
+pcre2 = { version = "0.2", optional = true }
+
+[features]
+default = ["pcre2-fallback"]
+pcre2-fallback = ["pcre2"]
 
 [dev-dependencies]
 criterion = { version = "0.7.0", default-features = false, features = ["html_reports"] }
+tokio = { version = "1", features = ["rt", "macros"] }
 
 [[bench]]
 name = "benchmarks"
@@ -30,8 +44,8 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
-# Bench profile: optimized with debug symbols for profiling
+# Bench profile: fast iteration, decent optimization
 [profile.bench]
 inherits = "release"
 strip = false
-debug = 2
+debug = 1
