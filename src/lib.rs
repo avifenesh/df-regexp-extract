@@ -70,6 +70,25 @@ use std::sync::Arc;
 use pcre2::bytes::{Regex as Pcre2Regex, RegexBuilder as Pcre2Builder};
 
 // ============================================================================
+// ERROR MESSAGE CONSTANTS
+// ============================================================================
+
+/// Error message for negative index values detected at runtime during batch processing
+const ERR_IDX_NEGATIVE: &str = "idx must be >= 0";
+
+/// Error message for negative index values detected as scalar literals during planning
+const ERR_IDX_NEGATIVE_LITERAL: &str = "regexp_extract: idx must be >= 0 (negative literal)";
+
+/// Error message for incorrect number of arguments
+const ERR_INVALID_ARG_COUNT: &str = "regexp_extract expects two or three arguments";
+
+/// Error message for incorrect Int32 scalar type
+const ERR_EXPECTED_INT32_SCALAR: &str = "expected Int32 scalar for idx";
+
+/// Error message for incorrect Int32 array type
+const ERR_EXPECTED_INT32_ARRAY: &str = "expected Int32 array for idx";
+
+// ============================================================================
 // COMPILED REGEX HELPERS
 // ============================================================================
 
@@ -509,9 +528,7 @@ fn regexp_extract_udf_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
         3 => (&args[0], &args[1], &args[2]),
         2 => (&args[0], &args[1], &default_idx),
         _ => {
-            return Err(DataFusionError::Execution(
-                "regexp_extract expects two or three arguments".to_string(),
-            ));
+            return Err(DataFusionError::Execution(ERR_INVALID_ARG_COUNT.to_string()));
         }
     };
 
@@ -537,9 +554,7 @@ fn regexp_extract_kernel(
     if let Some(k) = idx_input.scalar_value()
         && k < 0
     {
-        return Err(DataFusionError::Plan(
-            "regexp_extract: idx must be >= 0 (negative literal)".to_string(),
-        ));
+        return Err(DataFusionError::Plan(ERR_IDX_NEGATIVE_LITERAL.to_string()));
     }
 
     let n = string_input
@@ -585,7 +600,7 @@ fn regexp_extract_kernel(
                             let idx_value = idx_input.value_unchecked(i);
                             if idx_value < 0 {
                                 return Err(DataFusionError::Execution(
-                                    "idx must be >= 0".to_string(),
+                                    ERR_IDX_NEGATIVE.to_string(),
                                 ));
                             }
 
@@ -607,7 +622,7 @@ fn regexp_extract_kernel(
                             let idx_value = idx_input.value_unchecked(i);
                             if idx_value < 0 {
                                 return Err(DataFusionError::Execution(
-                                    "idx must be >= 0".to_string(),
+                                    ERR_IDX_NEGATIVE.to_string(),
                                 ));
                             }
 
@@ -654,7 +669,7 @@ fn regexp_extract_kernel(
                         }
                         let idx_value = idx_input.value_unchecked(i);
                         if idx_value < 0 {
-                            return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
+                            return Err(DataFusionError::Execution(ERR_IDX_NEGATIVE.to_string()));
                         }
 
                         let s = large_utf8_arr.value(i);
@@ -685,7 +700,7 @@ fn regexp_extract_kernel(
                         }
                         let idx_value = idx_input.value_unchecked(i);
                         if idx_value < 0 {
-                            return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
+                            return Err(DataFusionError::Execution(ERR_IDX_NEGATIVE.to_string()));
                         }
 
                         let s = large_utf8_arr.value(i);
@@ -720,7 +735,7 @@ fn regexp_extract_kernel(
             let s = string_input.value_unchecked(i);
             let idx_value = idx_input.value_unchecked(i);
             if idx_value < 0 {
-                return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
+                return Err(DataFusionError::Execution(ERR_IDX_NEGATIVE.to_string()));
             }
             let capture = compiled.get_capture(s, idx_value as usize);
             builder.append_value(capture);
@@ -805,7 +820,7 @@ fn regexp_extract_kernel(
             let pattern = pattern_input.value_unchecked(i);
             let idx_value = idx_input.value_unchecked(i);
             if idx_value < 0 {
-                return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
+                return Err(DataFusionError::Execution(ERR_IDX_NEGATIVE.to_string()));
             }
 
             let row_start = offsets[i];
@@ -904,9 +919,7 @@ impl<'a> Input<'a, i32, Int32Array> {
                 } else {
                     match value {
                         ScalarValue::Int32(opt) => Ok(Self::Scalar(*opt)),
-                        _ => Err(DataFusionError::Execution(
-                            "expected Int32 scalar for idx".to_string(),
-                        )),
+                        _ => Err(DataFusionError::Execution(ERR_EXPECTED_INT32_SCALAR.to_string())),
                     }
                 }
             }
@@ -914,9 +927,7 @@ impl<'a> Input<'a, i32, Int32Array> {
                 if let Some(ints) = array.as_any().downcast_ref::<Int32Array>() {
                     Ok(Self::Array(ints))
                 } else {
-                    Err(DataFusionError::Execution(
-                        "expected Int32 array for idx".to_string(),
-                    ))
+                    Err(DataFusionError::Execution(ERR_EXPECTED_INT32_ARRAY.to_string()))
                 }
             }
         }
