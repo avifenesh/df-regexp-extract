@@ -1,6 +1,5 @@
 /// Test data generation utilities for comprehensive benchmarking
 use datafusion::arrow::array::StringArray;
-use std::fmt::Write as FmtWrite;
 
 /// Configuration for generating test datasets
 #[derive(Debug, Clone)]
@@ -167,58 +166,6 @@ pub fn generate_urls(config: &DataConfig) -> StringArray {
             let mut s = format!("not-a-url-{}", i);
             while s.len() < min_len {
                 s.push_str("-more-text");
-            }
-            if s.len() > max_len {
-                s.truncate(max_len);
-            }
-            data.push(Some(s));
-        }
-    }
-
-    StringArray::from(data)
-}
-
-/// Generates test data for complex pattern with multiple groups
-pub fn generate_structured_data(config: &DataConfig) -> StringArray {
-    let mut data = Vec::with_capacity(config.size);
-    let (min_len, max_len) = config.string_length.range();
-
-    for i in 0..config.size {
-        if (i as f64 / config.size as f64) < config.null_rate {
-            data.push(None);
-            continue;
-        }
-
-        let should_match = (i as f64 / config.size as f64) >= config.null_rate
-            && ((i - (config.size as f64 * config.null_rate) as usize) as f64
-                / (config.size as f64 * (1.0 - config.null_rate)))
-                < config.match_rate;
-
-        if should_match {
-            // Format: KEY=value|ID:12345|STATUS=active
-            let mut s = String::new();
-            write!(
-                s,
-                "KEY=item{}|ID:{}|STATUS={}",
-                i % 100,
-                10000 + (i % 90000),
-                if i % 2 == 0 { "active" } else { "pending" }
-            )
-            .unwrap();
-
-            // Pad to desired length
-            while s.len() < min_len {
-                write!(s, "|EXTRA=data{}", i % 1000).unwrap();
-            }
-            if s.len() > max_len {
-                s.truncate(max_len);
-            }
-
-            data.push(Some(s));
-        } else {
-            let mut s = format!("unstructured_data_{}", i);
-            while s.len() < min_len {
-                s.push_str("_random");
             }
             if s.len() > max_len {
                 s.truncate(max_len);

@@ -228,10 +228,12 @@ fn generate_column_pattern_files() -> Result<(), Box<dyn std::error::Error>> {
     println!("Generating column_patterns files...");
     let size = 10_000;
 
-    let base_patterns = [r"(\w+)-(\d+)",
+    let base_patterns = [
+        r"(\w+)-(\d+)",
         r"([a-z]+)_(\d{3})",
         r"^user(\d+)$",
-        r"(\w{3,5})-(\d{2,4})"];
+        r"(\w{3,5})-(\d{2,4})",
+    ];
 
     // Low cardinality (4 unique patterns)
     {

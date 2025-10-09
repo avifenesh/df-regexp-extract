@@ -137,8 +137,9 @@ fn generate_pattern_column(size: usize, unique_patterns: usize) -> Vec<String> {
 /// Benchmark: Scalar pattern with scalar idx (baseline - Step 1)
 fn bench_scalar_pattern_various_sizes(c: &mut Criterion) {
     let mut group = c.benchmark_group("scalar_pattern");
+    group.sample_size(20); // Fast iteration: 20 samples instead of 100
 
-    for size in [1_000, 10_000, 100_000, 1_000_000].iter() {
+    for size in [10_000, 100_000].iter() {
         let arr = generate_plan_v1_dataset(*size, 0.8);
         let re = Regex::new(r"(\w+)-(\d+)").unwrap();
 
@@ -155,13 +156,14 @@ fn bench_scalar_pattern_various_sizes(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark: Different match rates (0%, 25%, 50%, 75%, 100%)
+/// Benchmark: Different match rates (0%, 50%, 100%)
 fn bench_match_rates(c: &mut Criterion) {
     let mut group = c.benchmark_group("match_rates");
-    let size = 100_000;
+    group.sample_size(20);
+    let size = 10_000;
     let re = Regex::new(r"(\w+)-(\d+)").unwrap();
 
-    for match_rate in [0.0, 0.25, 0.5, 0.75, 1.0].iter() {
+    for match_rate in [0.0, 0.5, 1.0].iter() {
         let arr = generate_plan_v1_dataset(size, *match_rate);
 
         group.throughput(Throughput::Elements(size as u64));
@@ -184,7 +186,8 @@ fn bench_match_rates(c: &mut Criterion) {
 /// Benchmark: Different string lengths (short, medium, long)
 fn bench_string_lengths(c: &mut Criterion) {
     let mut group = c.benchmark_group("string_lengths");
-    let size = 100_000;
+    group.sample_size(20);
+    let size = 10_000;
     let re = Regex::new(r"(\w+)-(\d+)").unwrap();
 
     for (name, length_type) in [
@@ -218,10 +221,11 @@ fn bench_string_lengths(c: &mut Criterion) {
 /// Benchmark: Null handling with different null rates
 fn bench_null_rates(c: &mut Criterion) {
     let mut group = c.benchmark_group("null_rates");
-    let size = 100_000;
+    group.sample_size(20);
+    let size = 10_000;
     let re = Regex::new(r"(\w+)-(\d+)").unwrap();
 
-    for null_rate in [0.0, 0.2, 0.5].iter() {
+    for null_rate in [0.0, 0.5].iter() {
         let config = DataConfig {
             size,
             string_length: StringLength::Short,
@@ -250,11 +254,12 @@ fn bench_null_rates(c: &mut Criterion) {
 /// Benchmark: Different group indices (idx=0, 1, 2)
 fn bench_group_indices(c: &mut Criterion) {
     let mut group = c.benchmark_group("group_indices");
-    let size = 100_000;
+    group.sample_size(20);
+    let size = 10_000;
     let arr = generate_plan_v1_dataset(size, 0.8);
     let re = Regex::new(r"(\w+)-(\d+)").unwrap();
 
-    for idx in [0, 1, 2].iter() {
+    for idx in [0, 1].iter() {
         group.throughput(Throughput::Elements(size as u64));
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("idx_{}", idx)),
@@ -273,18 +278,14 @@ fn bench_group_indices(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark: Pattern complexity (simple, medium, complex)
+/// Benchmark: Pattern complexity (simple, complex)
 fn bench_pattern_complexity(c: &mut Criterion) {
     let mut group = c.benchmark_group("pattern_complexity");
-    let size = 100_000;
+    group.sample_size(20);
+    let size = 10_000;
 
     let patterns = vec![
         ("simple", r"\w+", generate_plan_v1_dataset(size, 0.9)),
-        (
-            "medium",
-            r"(\w+)-(\d+)",
-            generate_plan_v1_dataset(size, 0.8),
-        ),
         (
             "complex",
             r"(\w+)-(\d+)|(\w+)_(\d+)|(\w+)\.(\d+)",
@@ -308,10 +309,11 @@ fn bench_pattern_complexity(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark: Realistic workloads (log lines, URLs, structured data)
+/// Benchmark: Realistic workloads (log lines, URLs)
 fn bench_realistic_workloads(c: &mut Criterion) {
     let mut group = c.benchmark_group("realistic_workloads");
-    let size = 100_000;
+    group.sample_size(20);
+    let size = 10_000;
 
     // Log line extraction: [LEVEL] Component: message
     let log_config = DataConfig {
@@ -351,32 +353,14 @@ fn bench_realistic_workloads(c: &mut Criterion) {
         });
     });
 
-    // Structured key-value extraction: KEY=value|ID:12345
-    let kv_config = DataConfig {
-        size,
-        string_length: StringLength::Medium,
-        match_rate: 0.95,
-        null_rate: 0.02,
-    };
-    let kv_arr = generate_structured_data(&kv_config);
-    let kv_re = Regex::new(r"ID:(\d+)").unwrap();
-
-    group.throughput(Throughput::Elements(size as u64));
-    group.bench_function("structured_kv", |b| {
-        b.iter(|| {
-            let out =
-                bench_eval_regexp_extract_utf8(black_box(&kv_arr), black_box(&kv_re), 1).unwrap();
-            black_box(out);
-        });
-    });
-
     group.finish();
 }
 
-/// Benchmark: Edge cases (all nulls, all matches, no matches, identical strings)
+/// Benchmark: Edge cases (all nulls, identical strings)
 fn bench_edge_cases(c: &mut Criterion) {
     let mut group = c.benchmark_group("edge_cases");
-    let size = 100_000;
+    group.sample_size(20);
+    let size = 10_000;
     let re = Regex::new(r"(\w+)-(\d+)").unwrap();
 
     // All nulls
@@ -393,7 +377,7 @@ fn bench_edge_cases(c: &mut Criterion) {
     // All identical strings (best case for caching)
     let all_matching = generate_identical_strings(size, true);
     group.throughput(Throughput::Elements(size as u64));
-    group.bench_function("all_identical_matching", |b| {
+    group.bench_function("identical", |b| {
         b.iter(|| {
             let out = bench_eval_regexp_extract_utf8(black_box(&all_matching), black_box(&re), 1)
                 .unwrap();
@@ -401,26 +385,16 @@ fn bench_edge_cases(c: &mut Criterion) {
         });
     });
 
-    let all_non_matching = generate_identical_strings(size, false);
-    group.throughput(Throughput::Elements(size as u64));
-    group.bench_function("all_identical_non_matching", |b| {
-        b.iter(|| {
-            let out =
-                bench_eval_regexp_extract_utf8(black_box(&all_non_matching), black_box(&re), 1)
-                    .unwrap();
-            black_box(out);
-        });
-    });
-
     group.finish();
 }
 
-/// Benchmark: PLAN-V1 Step 0 - Batch sizes (8K, 64K, 256K)
+/// Benchmark: Batch sizes (8K, 64K)
 fn bench_batch_sizes(c: &mut Criterion) {
     let mut group = c.benchmark_group("batch_sizes");
+    group.sample_size(20);
     let re = Regex::new(r"(\w+)-(\d+)").unwrap();
 
-    for batch_size in [8_192, 65_536, 262_144].iter() {
+    for batch_size in [8_192, 65_536].iter() {
         let arr = generate_plan_v1_dataset(*batch_size, 0.8);
 
         group.throughput(Throughput::Elements(*batch_size as u64));
@@ -440,22 +414,17 @@ fn bench_batch_sizes(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark: Column pattern cardinality (PLAN-V1 Step 3 baseline before LRU)
-/// Tests per-row regex compilation overhead with low/mid/high cardinality patterns
+/// Benchmark: Column pattern cardinality (baseline before LRU cache)
+/// Tests per-row regex compilation overhead - KEY for measuring Step-4 LRU improvements
 fn bench_column_pattern_cardinality(c: &mut Criterion) {
     let mut group = c.benchmark_group("column_pattern_cardinality");
-    let size = 10_000; // Smaller size since per-row compile is expensive
+    group.sample_size(10); // Even fewer samples - this is expensive
+    let size = 10_000;
 
     // Create tokio runtime for async UDF execution
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    for (name, unique_count) in [
-        ("low_4_uniques", 4),
-        ("mid_128_uniques", 128),
-        ("high_all_unique", size),
-    ]
-    .iter()
-    {
+    for (name, unique_count) in [("low_4", 4), ("high_10k", size)].iter() {
         // Generate data and pattern column
         let data_arr = generate_plan_v1_dataset(size, 0.8);
         let pattern_col = generate_pattern_column(size, *unique_count);

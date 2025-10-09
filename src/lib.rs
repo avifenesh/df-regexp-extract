@@ -4,10 +4,6 @@
 //!    - Option A: `fancy-regex` (pure Rust). Option B (feature-gated): PCRE2 via FFI.
 //!    - Safety knobs: match timeout / step budget; telemetry for fallback hits.
 //!
-//! 2) Step-3: Column pattern/idx baseline (done in Step-1 brute-force)
-//!    - Keep per-row compile for correctness; measure cost (criterion benches).
-//!    - Ensure NULL fast paths remain tight for column args.
-//!
 //! 3) Step-4: Per-batch LRU cache for column patterns
 //!    - Tiny LRU (cap 32–128) mapping `pattern -> compiled` to avoid re-compiles in a batch.
 //!    - Batch-scoped only (no global locks); record LRU hit/miss.
@@ -24,18 +20,6 @@
 //! 6) Step-7: String ergonomics
 //!    - Add zero-copy support for `LargeUtf8` / `StringView` (avoid copying into Utf8).
 //!    - Confirm capacity hints stay accurate with new string forms.
-//!
-//! 7) Step-8: Spark parity polish
-//!    - Confirm literal negative `idx` fails at plan time (done); column negative at runtime.
-//!    - Document engine differences and fallback semantics.
-//!
-//! 8) Step-9: Configuration surface
-//!    - Feature flag `pcre2` for PCRE backend; env/config for match limits and pool size.
-//!    - Expose knobs via UDF registry metadata if needed.
-//!
-//! 9) Step-10: Robustness
-//!    - Add property tests (proptest) and fuzzing for regex/match paths.
-//!    - Add adversarial patterns (catastrophic backtracking) to validate guards.
 use datafusion::arrow::array::{
     Array, ArrayRef, Int32Array, LargeStringArray, StringArray, StringBuilder, new_null_array,
 };
