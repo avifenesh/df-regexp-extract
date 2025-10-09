@@ -64,7 +64,7 @@ use datafusion::logical_expr::{
 use lru::LruCache;
 use regex::Regex;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "pcre2-fallback")]
 use pcre2::bytes::{Regex as Pcre2Regex, RegexBuilder as Pcre2Builder};
@@ -87,6 +87,37 @@ const ERR_EXPECTED_INT32_SCALAR: &str = "expected Int32 scalar for idx";
 
 /// Error message for incorrect Int32 array type
 const ERR_EXPECTED_INT32_ARRAY: &str = "expected Int32 array for idx";
+
+// Cold error constructors to optimize branch prediction
+#[cold]
+#[inline(never)]
+fn err_idx_negative() -> DataFusionError {
+    DataFusionError::Execution(ERR_IDX_NEGATIVE.to_string())
+}
+
+#[cold]
+#[inline(never)]
+fn err_idx_negative_literal() -> DataFusionError {
+    DataFusionError::Plan(ERR_IDX_NEGATIVE_LITERAL.to_string())
+}
+
+#[cold]
+#[inline(never)]
+fn err_invalid_arg_count() -> DataFusionError {
+    DataFusionError::Execution(ERR_INVALID_ARG_COUNT.to_string())
+}
+
+#[cold]
+#[inline(never)]
+fn err_expected_int32_scalar() -> DataFusionError {
+    DataFusionError::Execution(ERR_EXPECTED_INT32_SCALAR.to_string())
+}
+
+#[cold]
+#[inline(never)]
+fn err_expected_int32_array() -> DataFusionError {
+    DataFusionError::Execution(ERR_EXPECTED_INT32_ARRAY.to_string())
+}
 
 // ============================================================================
 // COMPILED REGEX HELPERS
@@ -197,39 +228,53 @@ impl CompiledRegex {
 }
 
 // ============================================================================
-// CONFIGURATION CONSTANTS
+// CONFIGURATION CONSTANTS (Cached)
 // ============================================================================
+
+/// Cached configuration values (initialized once, read many times)
+static REGEX_CACHE_CAPACITY: OnceLock<usize> = OnceLock::new();
+static MAX_ZERO_COPY_BUFFER_SIZE: OnceLock<usize> = OnceLock::new();
+static LARGE_UTF8_BLOCK_SIZE: OnceLock<i64> = OnceLock::new();
 
 /// LRU cache capacity for column pattern compilation.
 /// Balances memory usage vs cache hit rate for workloads with varying pattern cardinality.
 /// Override with `DF_REGEX_CACHE_SIZE` environment variable.
+#[inline(always)]
 fn regex_cache_capacity() -> usize {
-    std::env::var("DF_REGEX_CACHE_SIZE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(64) // Default: 64 unique patterns per batch
+    *REGEX_CACHE_CAPACITY.get_or_init(|| {
+        std::env::var("DF_REGEX_CACHE_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64) // Default: 64 unique patterns per batch
+    })
 }
 
 /// Maximum buffer size for zero-copy StringView extraction.
 /// Prevents RSS bloat from pinning huge buffers with low match utilization.
 /// Override with `DF_MAX_ZERO_COPY_BUFFER_MB` environment variable (in megabytes).
+#[inline(always)]
 fn max_zero_copy_buffer_size() -> usize {
-    std::env::var("DF_MAX_ZERO_COPY_BUFFER_MB")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|mb| mb * 1024 * 1024)
-        .unwrap_or(128 * 1024 * 1024) // Default: 128MB
+    *MAX_ZERO_COPY_BUFFER_SIZE.get_or_init(|| {
+        std::env::var("DF_MAX_ZERO_COPY_BUFFER_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(128 * 1024 * 1024) // Default: 128MB
+    })
 }
 
 /// Block size for LargeUtf8 buffer coalescing.
 /// Trades off block count vs granularity for zero-copy extraction.
 /// Override with `DF_LARGE_UTF8_BLOCK_SIZE_MB` environment variable (in megabytes).
+#[inline(always)]
 fn large_utf8_block_size() -> i64 {
-    std::env::var("DF_LARGE_UTF8_BLOCK_SIZE_MB")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .map(|mb| mb * 1024 * 1024)
-        .unwrap_or(2 * 1024 * 1024) // Default: 2MB
+    *LARGE_UTF8_BLOCK_SIZE.get_or_init(|| {
+        std::env::var("DF_LARGE_UTF8_BLOCK_SIZE_MB")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(2 * 1024 * 1024) // Default: 2MB
+    })
 }
 
 // ============================================================================
@@ -274,7 +319,7 @@ impl RegexCache {
 // BUILDER HELPERS
 // ============================================================================
 
-#[inline]
+#[inline(always)]
 fn append_view(
     builder: &mut StringViewBuilder,
     block_id: u32,
@@ -289,7 +334,7 @@ fn append_view(
 
 /// Find which block contains a string, using O(1) calculation instead of linear search.
 /// Returns (block_id, offset_in_block) if string is fully contained in one block, None otherwise.
-#[inline]
+#[inline(always)]
 fn find_block_for_string(
     blocks: &[(i64, i64, u32)],
     block_size: i64,
@@ -300,7 +345,8 @@ fn find_block_for_string(
     let block_idx = (row_start / block_size) as usize;
 
     if block_idx < blocks.len() {
-        let (block_start, block_end, block_id) = blocks[block_idx];
+        // SAFETY: We just checked block_idx < blocks.len() above
+        let (block_start, block_end, block_id) = unsafe { *blocks.get_unchecked(block_idx) };
         // Verify string is fully contained in this block
         if row_start >= block_start && row_end <= block_end {
             let offset_in_block = (row_start - block_start) as u32;
@@ -313,7 +359,7 @@ fn find_block_for_string(
 
 /// Extract capture group using zero-copy StringView when possible.
 /// Returns true if match was found and extracted, false if no match (caller should append empty string).
-#[inline]
+#[inline(always)]
 fn extract_match_zero_copy(
     regex: &Regex,
     text: &str,
@@ -347,7 +393,7 @@ fn extract_match_zero_copy(
 /// Extract capture group from PCRE2 regex using zero-copy StringView when possible.
 /// Returns true if match was found and extracted, false if no match (caller should append empty string).
 #[cfg(feature = "pcre2-fallback")]
-#[inline]
+#[inline(always)]
 fn extract_match_zero_copy_pcre2(
     regex: &Pcre2Regex,
     text: &str,
@@ -528,7 +574,7 @@ fn regexp_extract_udf_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
         3 => (&args[0], &args[1], &args[2]),
         2 => (&args[0], &args[1], &default_idx),
         _ => {
-            return Err(DataFusionError::Execution(ERR_INVALID_ARG_COUNT.to_string()));
+            return Err(err_invalid_arg_count());
         }
     };
 
@@ -554,7 +600,7 @@ fn regexp_extract_kernel(
     if let Some(k) = idx_input.scalar_value()
         && k < 0
     {
-        return Err(DataFusionError::Plan(ERR_IDX_NEGATIVE_LITERAL.to_string()));
+        return Err(err_idx_negative_literal());
     }
 
     let n = string_input
@@ -599,9 +645,7 @@ fn regexp_extract_kernel(
                             }
                             let idx_value = idx_input.value_unchecked(i);
                             if idx_value < 0 {
-                                return Err(DataFusionError::Execution(
-                                    ERR_IDX_NEGATIVE.to_string(),
-                                ));
+                                return Err(err_idx_negative());
                             }
 
                             let s = utf8_arr.value(i);
@@ -621,9 +665,7 @@ fn regexp_extract_kernel(
                             }
                             let idx_value = idx_input.value_unchecked(i);
                             if idx_value < 0 {
-                                return Err(DataFusionError::Execution(
-                                    ERR_IDX_NEGATIVE.to_string(),
-                                ));
+                                return Err(err_idx_negative());
                             }
 
                             let s = utf8_arr.value(i);
@@ -669,7 +711,7 @@ fn regexp_extract_kernel(
                         }
                         let idx_value = idx_input.value_unchecked(i);
                         if idx_value < 0 {
-                            return Err(DataFusionError::Execution(ERR_IDX_NEGATIVE.to_string()));
+                            return Err(err_idx_negative());
                         }
 
                         let s = large_utf8_arr.value(i);
@@ -700,7 +742,7 @@ fn regexp_extract_kernel(
                         }
                         let idx_value = idx_input.value_unchecked(i);
                         if idx_value < 0 {
-                            return Err(DataFusionError::Execution(ERR_IDX_NEGATIVE.to_string()));
+                            return Err(err_idx_negative());
                         }
 
                         let s = large_utf8_arr.value(i);
@@ -735,7 +777,7 @@ fn regexp_extract_kernel(
             let s = string_input.value_unchecked(i);
             let idx_value = idx_input.value_unchecked(i);
             if idx_value < 0 {
-                return Err(DataFusionError::Execution(ERR_IDX_NEGATIVE.to_string()));
+                return Err(err_idx_negative());
             }
             let capture = compiled.get_capture(s, idx_value as usize);
             builder.append_value(capture);
@@ -820,7 +862,7 @@ fn regexp_extract_kernel(
             let pattern = pattern_input.value_unchecked(i);
             let idx_value = idx_input.value_unchecked(i);
             if idx_value < 0 {
-                return Err(DataFusionError::Execution(ERR_IDX_NEGATIVE.to_string()));
+                return Err(err_idx_negative());
             }
 
             let row_start = offsets[i];
@@ -919,7 +961,7 @@ impl<'a> Input<'a, i32, Int32Array> {
                 } else {
                     match value {
                         ScalarValue::Int32(opt) => Ok(Self::Scalar(*opt)),
-                        _ => Err(DataFusionError::Execution(ERR_EXPECTED_INT32_SCALAR.to_string())),
+                        _ => Err(err_expected_int32_scalar()),
                     }
                 }
             }
@@ -927,7 +969,7 @@ impl<'a> Input<'a, i32, Int32Array> {
                 if let Some(ints) = array.as_any().downcast_ref::<Int32Array>() {
                     Ok(Self::Array(ints))
                 } else {
-                    Err(DataFusionError::Execution(ERR_EXPECTED_INT32_ARRAY.to_string()))
+                    Err(err_expected_int32_array())
                 }
             }
         }
