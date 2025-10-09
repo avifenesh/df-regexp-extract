@@ -84,6 +84,10 @@ pub fn make_regexp_extract_udf() -> ScalarUDF {
             DataType::LargeUtf8,
             DataType::Int32,
         ]),
+        TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
+        TypeSignature::Exact(vec![DataType::Utf8, DataType::LargeUtf8]),
+        TypeSignature::Exact(vec![DataType::LargeUtf8, DataType::Utf8]),
+        TypeSignature::Exact(vec![DataType::LargeUtf8, DataType::LargeUtf8]),
     ];
 
     let signature = Signature::one_of(signatures, Volatility::Immutable);
@@ -101,13 +105,18 @@ pub fn make_regexp_extract_udf() -> ScalarUDF {
 /// Implements the core UDF logic, extracting ColumnarValue inputs and calling kernel.
 #[inline]
 fn regexp_extract_udf_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    if args.len() != 3 {
-        return Err(DataFusionError::Execution(
-            "regexp_extract expects three arguments".to_string(),
-        ));
-    }
+    let default_idx = ColumnarValue::Scalar(ScalarValue::Int32(Some(1)));
+    let (str_arg, pat_arg, idx_arg) = match args.len() {
+        3 => (&args[0], &args[1], &args[2]),
+        2 => (&args[0], &args[1], &default_idx),
+        _ => {
+            return Err(DataFusionError::Execution(
+                "regexp_extract expects two or three arguments".to_string(),
+            ));
+        }
+    };
 
-    let result = regexp_extract_kernel(&args[0], &args[1], &args[2])?;
+    let result = regexp_extract_kernel(str_arg, pat_arg, idx_arg)?;
     Ok(ColumnarValue::Array(result))
 }
 
@@ -128,11 +137,12 @@ fn regexp_extract_kernel(
     let idx_input = Int32Input::new(idx_arg)?;
 
     if let Int32Input::Scalar(Some(k)) = idx_input
-        && k < 0 {
-            return Err(DataFusionError::Plan(
-                "regexp_extract: idx must be >= 0 (negative literal)".to_string(),
-            ));
-        }
+        && k < 0
+    {
+        return Err(DataFusionError::Plan(
+            "regexp_extract: idx must be >= 0 (negative literal)".to_string(),
+        ));
+    }
 
     let n = string_input
         .len()

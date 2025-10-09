@@ -1,0 +1,4 @@
+# Ignore large generated files (1M+ rows)
+**/1m.csv
+**/10m.csv
+large/

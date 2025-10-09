@@ -66,7 +66,7 @@ This, plus my tendency to overthink—and my habits as an OSS community leader a
 
 ### Full API compatibility with spark
 - The service promising plug and play compatibility with spark as one of the leading selling points, and if you sell "zero code changes" the code need to accept the same input, behave the same, and return the same output. But faster and less resource consuming.
-So first constraint - Don't break the user's space API.
+So first constraint - "never break the user's space API".
 
 ## Spark `regexp_extract` semantics
 
@@ -86,34 +86,37 @@ So first constraint - Don't break the user's space API.
 - Uses Java-style regex semantics.
 
 ```rust
+// wrong signature, not datafusion-ish and force non-default values
 fn regexp_extract(
     input: &ColumnarValue,      // string column or scalar
     pattern: &ColumnarValue,    // regex pattern (string column or scalar)
     group_idx: &ColumnarValue,  // capture group index (int64 scalar)
 ) -> Result<ColumnarValue>
 
-/// or:
-fn regexp_extract(args: &[ColumnarValue]) -> Result<ColumnarValue> // datafusion-ish signature
+// correct signature, datafusion-ish and default values
+fn regexp_extract(args: &[ColumnarValue]) -> Result<ColumnarValue>
 ```
 
 ### Challenges - first thoughts:
 - Regex in rust is not the same as in Java, it doesn't support lookahead, lookbehind, backreferences, and some other features. We need to use alternatives to support the Java semantics.
 - Regex, in general, is expensive and not simd friendly. We need to optimize it.
 - Input may be a scalar or an array column. We need to handle both cases, and each case has its own challenges.
+- The Rust-way of doing things not allowing default values. While theres the option to use None, when theres a struct with default value, the behavior the should be used in rust is using a builder pattern and use `with_`, and when not passed can use None as default, but None as a parameter is not for having a default value replacing it. Here we need to have a default value for the group_idx.
 ---
 
 ### Mitigations:
-- For regex support: 
-A. Easy way - add docs and constraints for the regex pattern, and let the user know that the regex pattern is not supported - not the point, cant sell the product this way.
-B. Less easy way - use a regex crate for most cases, with fallback engine (fancy-regex or optional PCRE2 via FFI) for the cases that are not supported. (fancy-regex? PCRE2? to be determined)
-C. Going even more crazy - use a custom regex engine that is optimized for the use case - bad idea, implementation cost and maintenance cost are too high, higher than the cost of the feature.
+- For regex support:
+1. Easy way - add docs and constraints for the regex pattern, and let the user know that the regex pattern is not supported - not the point, cant sell the product this way.
+2. Less easy way - use a regex crate for most cases, with fallback engine (fancy-regex or optional PCRE2 via FFI) for the cases that are not supported. (fancy-regex? PCRE2? to be determined)
+3. Going even more crazy - use a custom regex engine that is optimized for the use case - bad idea, implementation cost and maintenance cost are too high, higher than the cost of the feature.
 *verdict: B*
 
 - For performance optimization, first things that comes to mind:
-For scalar input, precompile the regex pattern once - not questionable, should be done.
-For columnar input:
-A. Precompile the regex pattern once per batch.
-B. Precompile the regex patterns for each row immediately.
+1. For scalar input, precompile the regex pattern once - not questionable, should be done.
+2. For columnar input:
+   1. Precompile the regex pattern once per batch.
+   2. Precompile the regex patterns for each row immediately.
+
 *lets add a point for the trade-off between the two*
 Enhancement: use a small cache for patterns - match against the cache first, if not found, compile the pattern and add to the cache. Pattern matching is cheaper then regex compilation.
 Feasibility - not complex.
@@ -127,9 +130,33 @@ Do we want for large batches and use threading to compile the patterns?
 lets write the sketch of the code and benchmark it.
 Then reassess and continue with the implementation.
 
-v1 is a brute-force baseline:
+## v0.1 is a brute-force baseline:
 	•	Compile regex once for scalar patterns, per-row for arrays.
 	•	Return NULL on any NULL input.
 	•	Reject non-Rust-regex patterns with error.
 	•	If idx < 0, error “must be ≥ 0.”
 	•	If idx exceeds capture groups, error “index out of range.”
+
+### Test coverage
+1. extracted the spark tests and created a contract tests to verify the behavior.
+2. In contract tests, added anything that is clear requirement from the docs.
+See [tests/spark_contract.rs](tests/spark_contract.rs)
+3. Added general test coverage - see [tests/regexp_extract_cases.md](tests/regexp_extract_cases.md).
+- *note: [a\\d]{0, 2} is not allowed in spark as not a valid java regex, but it is allowed in rust regex, decided to allow it, and removed the contract that was failing on it, it is open for discussion*
+*At this point the test all pass, beside the non valid rust regex:*
+    _spark_backreference_repeats_full_match_
+    _spark_default_index_defaults_to_group_one_
+    _spark_lookbehind_returns_captured_digits_
+    _spark_named_backreference_repeats_match_
+    _spark_negative_lookbehind_preserves_full_match_
+    _spark_positive_lookahead_selects_alphanumeric_word_
+
+## v0.2 accepting two or three arguments, and defaulting the group_idx to 1.
+### Test status:
+  Tests failing now are:
+    _spark_lookbehind_returns_captured_digits_
+    _spark_named_backreference_repeats_match_
+    _spark_negative_lookbehind_preserves_full_match_
+    _spark_positive_lookahead_selects_alphanumeric_word_
+
+## Benchmarking

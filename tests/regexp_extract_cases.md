@@ -13,3 +13,21 @@
 - `udf_idx_array_negative_errors`: verifies negative indices sourced from a column raise an error.
 - `spark_parity_doc_examples`: mirrors Spark docs to confirm parity for typical patterns.
 - `idx_negative_errors`: asserts kernel-level negative index rejects with an error.
+- `spark_doc_example_literal_pattern`: validates the SQL example from Spark docs returns group 1.
+- `spark_doc_example_raw_string_pattern`: ensures DataFrame usage with raw string literal parity.
+- `spark_string_regex_extract_dataset`: mirrors Spark’s dataset behavior when extracting group 1.
+- `spark_string_regex_extract_with_filter`: confirms extraction survives simple filter plans.
+- `spark_non_matching_optional_group`: documents optional group gaps aligning with Spark expectations.
+- `spark_regexp_extract_group_key`: ensures regex extraction plays nicely inside grouping keys.
+- `spark_default_index_defaults_to_group_one`: verifies omitted index defaults to group 1 per Spark semantics.
+- `spark_empty_input_returns_empty_string`: ensures empty source strings yield empty captures.
+- `spark_unicode_capture_preserves_prefix`: ensures multi-byte prefixes are extracted without truncation.
+- `spark_inline_case_insensitive_flag`: verifies inline flags behave like Spark's case-insensitive matching.
+- `spark_lookbehind_returns_captured_digits`: expects Spark-style look-behind extraction to return `"1"` (currently fails).
+- `spark_negative_lookbehind_preserves_full_match`: expects negative look-behind to yield `"bar"` like Spark (currently fails).
+- `spark_backreference_repeats_full_match`: expects backreference match `"abab"` (currently fails).
+- `spark_positive_lookahead_selects_alphanumeric_word`: expects positive lookahead to return the first alphanumeric token containing letters and digits (currently fails).
+- `spark_named_backreference_repeats_match`: expects named backreference to reproduce the matched value (currently fails).
+- `spark_column_pattern_and_index_null_handling`: checks columnar pattern/index combinations propagate nulls correctly.
+- `spark_scalar_null_inputs_propagate`: asserts scalar NULL arguments propagate to NULL results.
+- `spark_negative_lookahead_filters_prefix`: expects negative lookahead behavior aligned with Spark (currently fails).
