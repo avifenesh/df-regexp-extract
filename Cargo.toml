@@ -10,14 +10,6 @@ description = "DataFusion Scalar UDF: Spark-compatible regexp_extract (no SQL AP
 name = "df_regexp_extract"
 path = "src/lib.rs"
 
-[[bin]]
-name = "demo"
-path = "src/bin/demo.rs"
-
-[[bin]]
-name = "generate_csv_data"
-path = "src/bin/generate_csv_data.rs"
-
 [dependencies]
 datafusion = "50.1"
 regex = "1.10"
