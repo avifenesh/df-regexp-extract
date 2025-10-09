@@ -127,13 +127,12 @@ fn regexp_extract_kernel(
     let pattern_input = StringInput::new(pat_arg, "pattern")?;
     let idx_input = Int32Input::new(idx_arg)?;
 
-    if let Int32Input::Scalar(Some(k)) = idx_input {
-        if k < 0 {
+    if let Int32Input::Scalar(Some(k)) = idx_input
+        && k < 0 {
             return Err(DataFusionError::Plan(
                 "regexp_extract: idx must be >= 0 (negative literal)".to_string(),
             ));
         }
-    }
 
     let n = string_input
         .len()

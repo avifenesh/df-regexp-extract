@@ -4,7 +4,6 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 use df_regexp_extract::make_regexp_extract_udf;
 use std::sync::Arc;
-use tokio;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> datafusion::error::Result<()> {
