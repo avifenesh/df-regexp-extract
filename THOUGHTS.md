@@ -272,4 +272,4 @@ In the key-val world this would require more fine tuning and fences.
 - move extract match for zero copy to a mutual use function, cleaner code.
 - Extract magic numbers to constants, made some env configurable.
 - improve the search for text block to O(1) instead of O(n)
-rewrite from struct to enum for the different input types, and the different output types.
+= rewrite from struct to enum for the different input types, and the different output types.

@@ -1,3 +1,55 @@
+//! DataFusion Scalar UDF providing Spark-compatible `regexp_extract` function.
+//!
+//! This library implements regex pattern extraction with optimizations for high-performance DataFusion query execution.
+//!
+//! # Key Features
+//!
+//! - **Zero-copy extraction**: Uses `StringView` to avoid copying matched substrings from input buffers
+//! - **LRU cache**: Compiles each unique pattern once per batch for column pattern workloads
+//! - **PCRE2 fallback**: Optional support for advanced regex features (lookaround, backreferences)
+//! - **Configurable thresholds**: Runtime tuning via environment variables for cache size, buffer limits, and block size
+//!
+//! # Behavior
+//!
+//! - `idx=0`: Returns full match
+//! - `idx=1+`: Returns specified capture group (default: 1)
+//! - No match or missing group: Returns empty string `""` (NOT NULL)
+//! - NULL inputs: Propagated to NULL output
+//! - Negative idx: Returns error
+//!
+//! # Supported Types
+//!
+//! - String types: `Utf8`, `LargeUtf8`, `Utf8View`
+//! - Pattern types: `Utf8`, `LargeUtf8`, `Utf8View` (scalar or column)
+//! - Index type: `Int32` (scalar or column)
+//!
+//! # Example
+//!
+//! ```no_run
+//! use datafusion::prelude::*;
+//! use df_regexp_extract::make_regexp_extract_udf;
+//!
+//! # async fn example() -> datafusion::error::Result<()> {
+//! let ctx = SessionContext::new();
+//! ctx.register_udf(make_regexp_extract_udf());
+//!
+//! // Use in DataFrame API via expr_fn::scalar_udf
+//! // df.select(vec![scalar_udf("regexp_extract", vec![col("text"), lit(r"(\d+)"), lit(1)])])?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Configuration
+//!
+//! Environment variables control runtime behavior:
+//!
+//! - `DF_REGEX_CACHE_SIZE`: LRU cache capacity for column patterns (default: 64)
+//! - `DF_MAX_ZERO_COPY_BUFFER_MB`: Maximum buffer size for zero-copy extraction in MB (default: 128)
+//! - `DF_LARGE_UTF8_BLOCK_SIZE_MB`: Block size for LargeUtf8 coalescing in MB (default: 2)
+//! - `DF_PCRE2_MATCH_LIMIT`: PCRE2 match attempt limit (default: 1,000,000)
+//! - `DF_PCRE2_DEPTH_LIMIT`: PCRE2 recursion depth limit (default: matches match limit)
+//! - `DF_PCRE2_HEAP_LIMIT_KIB`: PCRE2 heap memory limit in KiB (default: 8192 = 8MB)
+
 use datafusion::arrow::array::{
     Array, ArrayRef, Int32Array, LargeStringArray, StringArray, StringViewArray, StringViewBuilder,
     new_null_array,
@@ -319,7 +371,81 @@ fn extract_match_zero_copy_pcre2(
 // PUBLIC API: UDF Factory
 // ============================================================================
 
-/// Public entry point: build and return the DataFusion `ScalarUDF` registered as `"regexp_extract"`.
+/// Creates a DataFusion ScalarUDF implementing Spark-compatible `regexp_extract`.
+///
+/// This function constructs a UDF that extracts substrings matching a regex pattern,
+/// with support for scalar and column patterns, multiple string types, and optional
+/// zero-copy extraction for optimal performance.
+///
+/// # Function Signature
+///
+/// ```text
+/// regexp_extract(str: Utf8/LargeUtf8/Utf8View, pattern: Utf8/LargeUtf8/Utf8View, idx: Int32 = 1) -> Utf8View
+/// ```
+///
+/// # Arguments
+///
+/// - `str`: Input string to search (scalar or column)
+/// - `pattern`: Regex pattern to match (scalar or column)
+/// - `idx`: Zero-based capture group index (scalar or column, optional, default: 1)
+///   - `idx=0`: Returns full match
+///   - `idx=1+`: Returns specified capture group
+///
+/// # Return Behavior
+///
+/// - **Match found**: Returns matched substring or capture group as `Utf8View`
+/// - **No match**: Returns empty string `""` (NOT NULL) - Spark-compatible behavior
+/// - **NULL input**: Returns NULL if any input is NULL
+/// - **Invalid idx**: Returns error if `idx < 0`
+/// - **Missing group**: Returns empty string `""` if capture group doesn't exist
+///
+/// # Performance Characteristics
+///
+/// ## Scalar Pattern (Fast Path)
+/// - Compiles regex once, reuses for all rows
+/// - Zero-copy extraction when possible:
+///   - `Utf8`: Single buffer ≤128MB → zero-copy views
+///   - `LargeUtf8`: 2MB blocks → zero-copy views for strings within blocks
+///   - `Utf8View`: Copies extracted matches (input already uses views)
+/// - Fallback: Copies matched substrings when zero-copy not possible
+///
+/// ## Column Pattern (Cache Path)
+/// - Uses LRU cache (default: 64 patterns per batch)
+/// - Each unique pattern compiled once per batch
+/// - Same zero-copy optimizations as scalar pattern path
+///
+/// # Registration Example
+///
+/// ```no_run
+/// use datafusion::prelude::*;
+/// use df_regexp_extract::make_regexp_extract_udf;
+///
+/// # async fn example() -> datafusion::error::Result<()> {
+/// let ctx = SessionContext::new();
+///
+/// // Register the UDF
+/// ctx.register_udf(make_regexp_extract_udf());
+///
+/// // Use in DataFrame API
+/// // let df = ctx.read_csv("data.csv", Default::default()).await?;
+/// // let result = df.select(vec![
+/// //     scalar_udf("regexp_extract", vec![col("text"), lit(r"user_(\d+)"), lit(1)])
+/// // ])?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Configuration
+///
+/// Tunable via environment variables:
+/// - `DF_REGEX_CACHE_SIZE`: LRU cache capacity (default: 64)
+/// - `DF_MAX_ZERO_COPY_BUFFER_MB`: Buffer size threshold (default: 128)
+/// - `DF_LARGE_UTF8_BLOCK_SIZE_MB`: Block coalescing size (default: 2)
+///
+/// # Features
+///
+/// - **`pcre2-fallback`** (default): Enables PCRE2 support for advanced regex features
+///   (lookaround, backreferences) when standard regex compilation fails
 #[inline]
 pub fn make_regexp_extract_udf() -> ScalarUDF {
     let signatures = vec![
