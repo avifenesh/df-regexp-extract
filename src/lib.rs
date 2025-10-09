@@ -162,6 +162,23 @@ impl RegexCache {
 }
 
 // ============================================================================
+// BUILDER HELPERS
+// ============================================================================
+
+#[inline]
+fn append_view(
+    builder: &mut StringViewBuilder,
+    block_id: u32,
+    offset: u32,
+    len: u32,
+) -> Result<()> {
+    builder
+        .try_append_view(block_id, offset, len)
+        .map_err(|err| DataFusionError::Execution(format!("regexp_extract: {err}")))?;
+    Ok(())
+}
+
+// ============================================================================
 // PUBLIC API: UDF Factory
 // ============================================================================
 
@@ -179,14 +196,30 @@ pub fn make_regexp_extract_udf() -> ScalarUDF {
         ]),
         TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
         TypeSignature::Exact(vec![DataType::Utf8, DataType::LargeUtf8]),
+        TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8View]),
         TypeSignature::Exact(vec![DataType::LargeUtf8, DataType::Utf8]),
         TypeSignature::Exact(vec![DataType::LargeUtf8, DataType::LargeUtf8]),
-        TypeSignature::Exact(vec![DataType::Utf8View, DataType::Utf8View, DataType::Int32]),
+        TypeSignature::Exact(vec![DataType::LargeUtf8, DataType::Utf8View]),
+        TypeSignature::Exact(vec![DataType::Utf8View, DataType::Utf8]),
+        TypeSignature::Exact(vec![DataType::Utf8View, DataType::LargeUtf8]),
+        TypeSignature::Exact(vec![
+            DataType::Utf8View,
+            DataType::Utf8View,
+            DataType::Int32,
+        ]),
         TypeSignature::Exact(vec![DataType::Utf8View, DataType::Utf8View]),
         TypeSignature::Exact(vec![DataType::Utf8View, DataType::Utf8, DataType::Int32]),
-        TypeSignature::Exact(vec![DataType::Utf8View, DataType::LargeUtf8, DataType::Int32]),
+        TypeSignature::Exact(vec![
+            DataType::Utf8View,
+            DataType::LargeUtf8,
+            DataType::Int32,
+        ]),
         TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8View, DataType::Int32]),
-        TypeSignature::Exact(vec![DataType::LargeUtf8, DataType::Utf8View, DataType::Int32]),
+        TypeSignature::Exact(vec![
+            DataType::LargeUtf8,
+            DataType::Utf8View,
+            DataType::Int32,
+        ]),
     ];
 
     let signature = Signature::one_of(signatures, Volatility::Immutable);
@@ -288,7 +321,9 @@ fn regexp_extract_kernel(
                             }
                             let idx_value = idx_input.value_unchecked(i);
                             if idx_value < 0 {
-                                return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
+                                return Err(DataFusionError::Execution(
+                                    "idx must be >= 0".to_string(),
+                                ));
                             }
 
                             let s = utf8_arr.value(i);
@@ -299,7 +334,7 @@ fn regexp_extract_kernel(
                                 if let Some(m) = regex.find(s) {
                                     let offset = row_start + m.start() as u32;
                                     let len = m.len() as u32;
-                                    builder.try_append_view(block_id, offset, len).unwrap();
+                                    append_view(&mut builder, block_id, offset, len)?;
                                 } else {
                                     builder.append_value(""); // Empty on no match
                                 }
@@ -309,7 +344,7 @@ fn regexp_extract_kernel(
                                     if let Some(m) = caps.get(idx_value as usize) {
                                         let offset = row_start + m.start() as u32;
                                         let len = m.len() as u32;
-                                        builder.try_append_view(block_id, offset, len).unwrap();
+                                        append_view(&mut builder, block_id, offset, len)?;
                                     } else {
                                         builder.append_value(""); // Empty if group doesn't exist
                                     }
@@ -328,7 +363,9 @@ fn regexp_extract_kernel(
                             }
                             let idx_value = idx_input.value_unchecked(i);
                             if idx_value < 0 {
-                                return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
+                                return Err(DataFusionError::Execution(
+                                    "idx must be >= 0".to_string(),
+                                ));
                             }
 
                             let s = utf8_arr.value(i);
@@ -341,7 +378,7 @@ fn regexp_extract_kernel(
                                     Ok(Some(m)) => {
                                         let offset = row_start + m.start() as u32;
                                         let len = (m.end() - m.start()) as u32;
-                                        builder.try_append_view(block_id, offset, len).unwrap();
+                                        append_view(&mut builder, block_id, offset, len)?;
                                     }
                                     _ => builder.append_value(""),
                                 }
@@ -352,7 +389,7 @@ fn regexp_extract_kernel(
                                         if let Some(m) = caps.get(idx_value as usize) {
                                             let offset = row_start + m.start() as u32;
                                             let len = (m.end() - m.start()) as u32;
-                                            builder.try_append_view(block_id, offset, len).unwrap();
+                                            append_view(&mut builder, block_id, offset, len)?;
                                         } else {
                                             builder.append_value("");
                                         }
@@ -424,7 +461,7 @@ fn regexp_extract_kernel(
                                 if let Some(m) = regex.find(s) {
                                     let offset = offset_in_block + m.start() as u32;
                                     let len = m.len() as u32;
-                                    builder.try_append_view(block_id, offset, len).unwrap();
+                                    append_view(&mut builder, block_id, offset, len)?;
                                 } else {
                                     builder.append_value("");
                                 }
@@ -432,7 +469,7 @@ fn regexp_extract_kernel(
                                 if let Some(m) = caps.get(idx_value as usize) {
                                     let offset = offset_in_block + m.start() as u32;
                                     let len = m.len() as u32;
-                                    builder.try_append_view(block_id, offset, len).unwrap();
+                                    append_view(&mut builder, block_id, offset, len)?;
                                 } else {
                                     builder.append_value("");
                                 }
@@ -485,7 +522,7 @@ fn regexp_extract_kernel(
                                     Ok(Some(m)) => {
                                         let offset = offset_in_block + m.start() as u32;
                                         let len = (m.end() - m.start()) as u32;
-                                        builder.try_append_view(block_id, offset, len).unwrap();
+                                        append_view(&mut builder, block_id, offset, len)?;
                                     }
                                     _ => builder.append_value(""),
                                 }
@@ -495,7 +532,7 @@ fn regexp_extract_kernel(
                                         if let Some(m) = caps.get(idx_value as usize) {
                                             let offset = offset_in_block + m.start() as u32;
                                             let len = (m.end() - m.start()) as u32;
-                                            builder.try_append_view(block_id, offset, len).unwrap();
+                                            append_view(&mut builder, block_id, offset, len)?;
                                         } else {
                                             builder.append_value("");
                                         }
@@ -607,7 +644,7 @@ fn regexp_extract_kernel(
                             if let Some(m) = r.find(s) {
                                 let offset = row_start + m.start() as u32;
                                 let len = m.len() as u32;
-                                builder.try_append_view(block_id, offset, len).unwrap();
+                                append_view(&mut builder, block_id, offset, len)?;
                             } else {
                                 builder.append_value("");
                             }
@@ -617,7 +654,7 @@ fn regexp_extract_kernel(
                                 if let Some(m) = caps.get(idx_value as usize) {
                                     let offset = row_start + m.start() as u32;
                                     let len = m.len() as u32;
-                                    builder.try_append_view(block_id, offset, len).unwrap();
+                                    append_view(&mut builder, block_id, offset, len)?;
                                 } else {
                                     builder.append_value("");
                                 }
@@ -634,7 +671,7 @@ fn regexp_extract_kernel(
                                 Ok(Some(m)) => {
                                     let offset = row_start + m.start() as u32;
                                     let len = (m.end() - m.start()) as u32;
-                                    builder.try_append_view(block_id, offset, len).unwrap();
+                                    append_view(&mut builder, block_id, offset, len)?;
                                 }
                                 _ => builder.append_value(""),
                             }
@@ -644,7 +681,7 @@ fn regexp_extract_kernel(
                                     if let Some(m) = caps.get(idx_value as usize) {
                                         let offset = row_start + m.start() as u32;
                                         let len = (m.end() - m.start()) as u32;
-                                        builder.try_append_view(block_id, offset, len).unwrap();
+                                        append_view(&mut builder, block_id, offset, len)?;
                                     } else {
                                         builder.append_value("");
                                     }
@@ -715,7 +752,7 @@ fn regexp_extract_kernel(
                             if let Some(m) = r.find(s) {
                                 let offset = offset_in_block + m.start() as u32;
                                 let len = m.len() as u32;
-                                builder.try_append_view(block_id, offset, len).unwrap();
+                                append_view(&mut builder, block_id, offset, len)?;
                             } else {
                                 builder.append_value("");
                             }
@@ -723,7 +760,7 @@ fn regexp_extract_kernel(
                             if let Some(m) = caps.get(idx_value as usize) {
                                 let offset = offset_in_block + m.start() as u32;
                                 let len = m.len() as u32;
-                                builder.try_append_view(block_id, offset, len).unwrap();
+                                append_view(&mut builder, block_id, offset, len)?;
                             } else {
                                 builder.append_value("");
                             }
@@ -739,7 +776,7 @@ fn regexp_extract_kernel(
                                 Ok(Some(m)) => {
                                     let offset = offset_in_block + m.start() as u32;
                                     let len = (m.end() - m.start()) as u32;
-                                    builder.try_append_view(block_id, offset, len).unwrap();
+                                    append_view(&mut builder, block_id, offset, len)?;
                                 }
                                 _ => builder.append_value(""),
                             }
@@ -749,7 +786,7 @@ fn regexp_extract_kernel(
                                     if let Some(m) = caps.get(idx_value as usize) {
                                         let offset = offset_in_block + m.start() as u32;
                                         let len = (m.end() - m.start()) as u32;
-                                        builder.try_append_view(block_id, offset, len).unwrap();
+                                        append_view(&mut builder, block_id, offset, len)?;
                                     } else {
                                         builder.append_value("");
                                     }

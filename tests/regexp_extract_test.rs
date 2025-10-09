@@ -70,7 +70,10 @@ async fn run_extract(
             })
             .collect())
     } else {
-        panic!("Expected StringArray or StringViewArray, got {:?}", col.data_type());
+        panic!(
+            "Expected StringArray or StringViewArray, got {:?}",
+            col.data_type()
+        );
     }
 }
 
@@ -197,7 +200,7 @@ async fn udf_via_dataframe_api() {
     let out = df.collect().await.unwrap();
     // Validate content quickly
     let b = &out[0];
-    
+
     // Handle both StringArray and StringViewArray
     let col1 = b.column(1);
     if let Some(s_col) = col1.as_any().downcast_ref::<StringArray>() {

@@ -36,7 +36,10 @@ fn assert_string_column(result: Vec<RecordBatch>, expected: &[&str]) {
             assert_eq!(view_array.value(idx), *value, "mismatch at row {idx}");
         }
     } else {
-        panic!("Expected StringArray or StringViewArray, got {:?}", col.data_type());
+        panic!(
+            "Expected StringArray or StringViewArray, got {:?}",
+            col.data_type()
+        );
     }
 }
 
@@ -91,7 +94,10 @@ fn assert_string_column_with_nulls(result: Vec<RecordBatch>, expected: &[Option<
             }
         }
     } else {
-        panic!("Expected StringArray or StringViewArray, got {:?}", col.data_type());
+        panic!(
+            "Expected StringArray or StringViewArray, got {:?}",
+            col.data_type()
+        );
     }
 }
 
