@@ -1,4 +1,6 @@
-use datafusion::arrow::array::{Array, ArrayRef, Int32Array, LargeStringArray, StringArray};
+use datafusion::arrow::array::{
+    Array, ArrayRef, Int32Array, LargeStringArray, StringArray, StringViewArray,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
@@ -195,9 +197,18 @@ async fn udf_via_dataframe_api() {
     let out = df.collect().await.unwrap();
     // Validate content quickly
     let b = &out[0];
-    let s_col = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-    assert_eq!(s_col.value(0), "123"); // idx=2 group
-    assert_eq!(s_col.value(1), ""); // no match -> ""
+    
+    // Handle both StringArray and StringViewArray
+    let col1 = b.column(1);
+    if let Some(s_col) = col1.as_any().downcast_ref::<StringArray>() {
+        assert_eq!(s_col.value(0), "123"); // idx=2 group
+        assert_eq!(s_col.value(1), ""); // no match -> ""
+    } else if let Some(v_col) = col1.as_any().downcast_ref::<StringViewArray>() {
+        assert_eq!(v_col.value(0), "123"); // idx=2 group
+        assert_eq!(v_col.value(1), ""); // no match -> ""
+    } else {
+        panic!("Expected StringArray or StringViewArray");
+    }
     assert!(b.column(0).is_null(2)); // input NULL propagated
 }
 
@@ -232,12 +243,16 @@ async fn udf_idx_zero_returns_full_match() {
         .unwrap();
 
     let out = df.collect().await.unwrap();
-    let col_out = out[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    assert_eq!(col_out.value(0), "ab-12");
+    let col_out = out[0].column(0);
+
+    // Handle both StringArray and StringViewArray
+    if let Some(s_arr) = col_out.as_any().downcast_ref::<StringArray>() {
+        assert_eq!(s_arr.value(0), "ab-12");
+    } else if let Some(v_arr) = col_out.as_any().downcast_ref::<StringViewArray>() {
+        assert_eq!(v_arr.value(0), "ab-12");
+    } else {
+        panic!("Expected StringArray or StringViewArray");
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -285,15 +300,22 @@ async fn udf_large_utf8_and_null_inputs() {
         .unwrap();
 
     let out = df.collect().await.unwrap();
-    let col_out = out[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    assert_eq!(col_out.value(0), "100");
-    assert!(col_out.is_null(1));
-    assert!(col_out.is_null(2));
-    assert!(col_out.is_null(3));
+    let col_out = out[0].column(0);
+
+    // Handle both StringArray and StringViewArray
+    if let Some(s_arr) = col_out.as_any().downcast_ref::<StringArray>() {
+        assert_eq!(s_arr.value(0), "100");
+        assert!(s_arr.is_null(1));
+        assert!(s_arr.is_null(2));
+        assert!(s_arr.is_null(3));
+    } else if let Some(v_arr) = col_out.as_any().downcast_ref::<StringViewArray>() {
+        assert_eq!(v_arr.value(0), "100");
+        assert!(v_arr.is_null(1));
+        assert!(v_arr.is_null(2));
+        assert!(v_arr.is_null(3));
+    } else {
+        panic!("Expected StringArray or StringViewArray");
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -335,13 +357,18 @@ async fn udf_group_out_of_range_returns_empty() {
         .unwrap();
 
     let out = df.collect().await.unwrap();
-    let col_out = out[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    assert_eq!(col_out.value(0), "");
-    assert_eq!(col_out.value(1), "");
+    let col_out = out[0].column(0);
+
+    // Handle both StringArray and StringViewArray
+    if let Some(s_arr) = col_out.as_any().downcast_ref::<StringArray>() {
+        assert_eq!(s_arr.value(0), "");
+        assert_eq!(s_arr.value(1), "");
+    } else if let Some(v_arr) = col_out.as_any().downcast_ref::<StringViewArray>() {
+        assert_eq!(v_arr.value(0), "");
+        assert_eq!(v_arr.value(1), "");
+    } else {
+        panic!("Expected StringArray or StringViewArray");
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -479,33 +506,33 @@ async fn spark_parity_doc_examples() {
     let batches = df.collect().await.unwrap();
     assert_eq!(batches.len(), 1);
     let batch = &batches[0];
-    let full = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let first = batch
-        .column(2)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let second = batch
-        .column(3)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
 
-    assert_eq!(full.value(0), "100-200");
-    assert_eq!(full.value(1), "");
-    assert_eq!(full.value(2), "");
+    // Helper to get value from either StringArray or StringViewArray
+    let get_value = |col_idx: usize, row_idx: usize| -> String {
+        let col = batch.column(col_idx);
+        if let Some(s_arr) = col.as_any().downcast_ref::<StringArray>() {
+            s_arr.value(row_idx).to_string()
+        } else if let Some(v_arr) = col.as_any().downcast_ref::<StringViewArray>() {
+            v_arr.value(row_idx).to_string()
+        } else {
+            panic!("Expected StringArray or StringViewArray");
+        }
+    };
 
-    assert_eq!(first.value(0), "100");
-    assert_eq!(first.value(1), "");
-    assert_eq!(first.value(2), "");
+    // full (column 1)
+    assert_eq!(get_value(1, 0), "100-200");
+    assert_eq!(get_value(1, 1), "");
+    assert_eq!(get_value(1, 2), "");
 
-    assert_eq!(second.value(0), "200");
-    assert_eq!(second.value(1), "");
-    assert_eq!(second.value(2), "");
+    // first (column 2)
+    assert_eq!(get_value(2, 0), "100");
+    assert_eq!(get_value(2, 1), "");
+    assert_eq!(get_value(2, 2), "");
+
+    // second (column 3)
+    assert_eq!(get_value(3, 0), "200");
+    assert_eq!(get_value(3, 1), "");
+    assert_eq!(get_value(3, 2), "");
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -1,5 +1,7 @@
 use datafusion::arrow::array::Int32Array;
-use datafusion::arrow::array::{Array, ArrayRef, Int64Array, StringArray, UInt64Array};
+use datafusion::arrow::array::{
+    Array, ArrayRef, Int64Array, StringArray, StringViewArray, UInt64Array,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
@@ -20,14 +22,21 @@ fn assert_string_column(result: Vec<RecordBatch>, expected: &[&str]) {
     );
     let batch = &result[0];
     assert_eq!(batch.num_columns(), 1, "expected single column output");
-    let col = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("StringArray output");
-    assert_eq!(col.len(), expected.len(), "row count mismatch");
-    for (idx, value) in expected.iter().enumerate() {
-        assert_eq!(col.value(idx), *value, "mismatch at row {idx}");
+    let col = batch.column(0);
+
+    // Handle both StringArray (Utf8) and StringViewArray (Utf8View)
+    if let Some(str_array) = col.as_any().downcast_ref::<StringArray>() {
+        assert_eq!(str_array.len(), expected.len(), "row count mismatch");
+        for (idx, value) in expected.iter().enumerate() {
+            assert_eq!(str_array.value(idx), *value, "mismatch at row {idx}");
+        }
+    } else if let Some(view_array) = col.as_any().downcast_ref::<StringViewArray>() {
+        assert_eq!(view_array.len(), expected.len(), "row count mismatch");
+        for (idx, value) in expected.iter().enumerate() {
+            assert_eq!(view_array.value(idx), *value, "mismatch at row {idx}");
+        }
+    } else {
+        panic!("Expected StringArray or StringViewArray, got {:?}", col.data_type());
     }
 }
 
@@ -40,23 +49,49 @@ fn assert_string_column_with_nulls(result: Vec<RecordBatch>, expected: &[Option<
     );
     let batch = &result[0];
     assert_eq!(batch.num_columns(), 1, "expected single column output");
-    let col = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("StringArray output");
-    assert_eq!(col.len(), expected.len(), "row count mismatch");
-    for (idx, expected_value) in expected.iter().enumerate() {
-        match expected_value {
-            Some(value) => {
-                assert!(
-                    !col.is_null(idx),
-                    "expected non-null at row {idx}, found null"
-                );
-                assert_eq!(col.value(idx), *value, "mismatch at row {idx}");
+    let col = batch.column(0);
+
+    // Handle both StringArray (Utf8) and StringViewArray (Utf8View)
+    if let Some(str_array) = col.as_any().downcast_ref::<StringArray>() {
+        assert_eq!(str_array.len(), expected.len(), "row count mismatch");
+        for (idx, expected_value) in expected.iter().enumerate() {
+            match expected_value {
+                Some(value) => {
+                    assert!(
+                        !str_array.is_null(idx),
+                        "expected non-null at row {idx}, found null"
+                    );
+                    assert_eq!(str_array.value(idx), *value, "value mismatch at row {idx}");
+                }
+                None => {
+                    assert!(
+                        str_array.is_null(idx),
+                        "expected null at row {idx}, found non-null"
+                    );
+                }
             }
-            None => assert!(col.is_null(idx), "expected null at row {idx}"),
         }
+    } else if let Some(view_array) = col.as_any().downcast_ref::<StringViewArray>() {
+        assert_eq!(view_array.len(), expected.len(), "row count mismatch");
+        for (idx, expected_value) in expected.iter().enumerate() {
+            match expected_value {
+                Some(value) => {
+                    assert!(
+                        !view_array.is_null(idx),
+                        "expected non-null at row {idx}, found null"
+                    );
+                    assert_eq!(view_array.value(idx), *value, "value mismatch at row {idx}");
+                }
+                None => {
+                    assert!(
+                        view_array.is_null(idx),
+                        "expected null at row {idx}, found non-null"
+                    );
+                }
+            }
+        }
+    } else {
+        panic!("Expected StringArray or StringViewArray, got {:?}", col.data_type());
     }
 }
 
@@ -69,11 +104,19 @@ fn assert_group_count(result: Vec<RecordBatch>, expected_key: &str, expected_cou
     );
     let batch = &result[0];
     assert_eq!(batch.num_columns(), 2, "expected two columns (key, count)");
-    let keys = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("StringArray key column");
+
+    // Handle both StringArray and StringViewArray for key column
+    let key_col = batch.column(0);
+    let key_value = if let Some(s_arr) = key_col.as_any().downcast_ref::<StringArray>() {
+        assert_eq!(s_arr.len(), 1, "expected single row");
+        s_arr.value(0)
+    } else if let Some(v_arr) = key_col.as_any().downcast_ref::<StringViewArray>() {
+        assert_eq!(v_arr.len(), 1, "expected single row");
+        v_arr.value(0)
+    } else {
+        panic!("Expected StringArray or StringViewArray for key column");
+    };
+
     let count_value = match batch.column(1).data_type() {
         DataType::UInt64 => batch
             .column(1)
@@ -89,9 +132,8 @@ fn assert_group_count(result: Vec<RecordBatch>, expected_key: &str, expected_cou
             .value(0) as u64,
         other => panic!("unexpected count type {other:?}"),
     };
-    assert_eq!(keys.len(), 1, "expected single row");
     assert_eq!(batch.column(1).len(), 1, "expected single row");
-    assert_eq!(keys.value(0), expected_key);
+    assert_eq!(key_value, expected_key);
     assert_eq!(count_value, expected_count);
 }
 

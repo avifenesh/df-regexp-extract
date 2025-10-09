@@ -266,6 +266,261 @@ fn regexp_extract_kernel(
     if let Some(pattern) = pattern_input.scalar_value() {
         let compiled = CompiledRegex::new_with_fallback(pattern)?;
 
+        // Zero-copy path for Utf8 input (StringArray)
+        if let Some(utf8_arr) = string_input.utf8 {
+            let values_buffer = utf8_arr.values().clone();
+
+            // Retention clamp: avoid pinning huge buffers with low match utilization
+            // If buffer > 128MB, fall back to copying to prevent RSS bloat
+            const MAX_ZERO_COPY_BUFFER_SIZE: usize = 128 * 1024 * 1024; // 128MB
+
+            if values_buffer.len() <= MAX_ZERO_COPY_BUFFER_SIZE {
+                // Register input buffer for zero-copy view creation
+                let block_id = builder.append_block(values_buffer);
+                let offsets = utf8_arr.offsets();
+
+                match compiled {
+                    CompiledRegex::Fast(regex) => {
+                        for i in 0..n {
+                            if utf8_arr.is_null(i) || idx_input.is_null(i) {
+                                builder.append_null();
+                                continue;
+                            }
+                            let idx_value = idx_input.value_unchecked(i);
+                            if idx_value < 0 {
+                                return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
+                            }
+
+                            let s = utf8_arr.value(i);
+                            let row_start = offsets[i] as u32;
+
+                            // Fast path: idx=0 returns full match using find()
+                            if idx_value == 0 {
+                                if let Some(m) = regex.find(s) {
+                                    let offset = row_start + m.start() as u32;
+                                    let len = m.len() as u32;
+                                    builder.try_append_view(block_id, offset, len).unwrap();
+                                } else {
+                                    builder.append_value(""); // Empty on no match
+                                }
+                            } else {
+                                // Normal path: extract capture group
+                                if let Some(caps) = regex.captures(s) {
+                                    if let Some(m) = caps.get(idx_value as usize) {
+                                        let offset = row_start + m.start() as u32;
+                                        let len = m.len() as u32;
+                                        builder.try_append_view(block_id, offset, len).unwrap();
+                                    } else {
+                                        builder.append_value(""); // Empty if group doesn't exist
+                                    }
+                                } else {
+                                    builder.append_value(""); // Empty on no match
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(feature = "pcre2-fallback")]
+                    CompiledRegex::Pcre2(regex) => {
+                        for i in 0..n {
+                            if utf8_arr.is_null(i) || idx_input.is_null(i) {
+                                builder.append_null();
+                                continue;
+                            }
+                            let idx_value = idx_input.value_unchecked(i);
+                            if idx_value < 0 {
+                                return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
+                            }
+
+                            let s = utf8_arr.value(i);
+                            let bytes = s.as_bytes();
+                            let row_start = offsets[i] as u32;
+
+                            // Fast path: idx=0 returns full match using find()
+                            if idx_value == 0 {
+                                match regex.find(bytes) {
+                                    Ok(Some(m)) => {
+                                        let offset = row_start + m.start() as u32;
+                                        let len = (m.end() - m.start()) as u32;
+                                        builder.try_append_view(block_id, offset, len).unwrap();
+                                    }
+                                    _ => builder.append_value(""),
+                                }
+                            } else {
+                                // Normal path: extract capture group
+                                match regex.captures(bytes) {
+                                    Ok(Some(caps)) => {
+                                        if let Some(m) = caps.get(idx_value as usize) {
+                                            let offset = row_start + m.start() as u32;
+                                            let len = (m.end() - m.start()) as u32;
+                                            builder.try_append_view(block_id, offset, len).unwrap();
+                                        } else {
+                                            builder.append_value("");
+                                        }
+                                    }
+                                    _ => builder.append_value(""),
+                                }
+                            }
+                        }
+                    }
+                }
+                return Ok(Arc::new(builder.finish()));
+            }
+            // If buffer > 128MB, fall through to copying path below
+        }
+
+        // Zero-copy path for LargeUtf8 input with 2MB block coalescing
+        if let Some(large_utf8_arr) = string_input.large_utf8 {
+            const BLOCK_SIZE: i64 = 2 * 1024 * 1024; // 2MB blocks
+            let values_buffer = large_utf8_arr.values();
+            let offsets = large_utf8_arr.offsets();
+
+            // Calculate block boundaries and register blocks
+            // slice() creates a zero-copy view from offset to end, so we track valid ranges
+            let total_bytes = values_buffer.len() as i64;
+            let mut blocks = Vec::new();
+            let mut block_start = 0i64;
+
+            while block_start < total_bytes {
+                let block_end = (block_start + BLOCK_SIZE).min(total_bytes);
+                let block_slice = values_buffer.slice(block_start as usize);
+                let block_id = builder.append_block(block_slice);
+                blocks.push((block_start, block_end, block_id));
+                block_start = block_end;
+            }
+
+            match compiled {
+                CompiledRegex::Fast(regex) => {
+                    for i in 0..n {
+                        if large_utf8_arr.is_null(i) || idx_input.is_null(i) {
+                            builder.append_null();
+                            continue;
+                        }
+                        let idx_value = idx_input.value_unchecked(i);
+                        if idx_value < 0 {
+                            return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
+                        }
+
+                        let s = large_utf8_arr.value(i);
+                        let row_start = offsets[i];
+                        let row_end = offsets[i + 1];
+
+                        // Find which block(s) this string spans
+                        // For simplicity, if string spans multiple blocks, copy it
+                        let mut block_id_opt = None;
+                        let mut offset_in_block = 0u32;
+
+                        for &(block_start, block_end, block_id) in &blocks {
+                            if row_start >= block_start && row_end <= block_end {
+                                // String is fully contained in this block
+                                block_id_opt = Some(block_id);
+                                offset_in_block = (row_start - block_start) as u32;
+                                break;
+                            }
+                        }
+
+                        if let Some(block_id) = block_id_opt {
+                            // Zero-copy path: string is in one block
+                            if idx_value == 0 {
+                                if let Some(m) = regex.find(s) {
+                                    let offset = offset_in_block + m.start() as u32;
+                                    let len = m.len() as u32;
+                                    builder.try_append_view(block_id, offset, len).unwrap();
+                                } else {
+                                    builder.append_value("");
+                                }
+                            } else if let Some(caps) = regex.captures(s) {
+                                if let Some(m) = caps.get(idx_value as usize) {
+                                    let offset = offset_in_block + m.start() as u32;
+                                    let len = m.len() as u32;
+                                    builder.try_append_view(block_id, offset, len).unwrap();
+                                } else {
+                                    builder.append_value("");
+                                }
+                            } else {
+                                builder.append_value("");
+                            }
+                        } else {
+                            // Fallback: string spans multiple blocks, copy it
+                            let capture = regex
+                                .captures(s)
+                                .and_then(|caps| caps.get(idx_value as usize).map(|m| m.as_str()))
+                                .unwrap_or("");
+                            builder.append_value(capture);
+                        }
+                    }
+                }
+                #[cfg(feature = "pcre2-fallback")]
+                CompiledRegex::Pcre2(regex) => {
+                    for i in 0..n {
+                        if large_utf8_arr.is_null(i) || idx_input.is_null(i) {
+                            builder.append_null();
+                            continue;
+                        }
+                        let idx_value = idx_input.value_unchecked(i);
+                        if idx_value < 0 {
+                            return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
+                        }
+
+                        let s = large_utf8_arr.value(i);
+                        let bytes = s.as_bytes();
+                        let row_start = offsets[i];
+                        let row_end = offsets[i + 1];
+
+                        // Find which block this string is in
+                        let mut block_id_opt = None;
+                        let mut offset_in_block = 0u32;
+
+                        for &(block_start, block_end, block_id) in &blocks {
+                            if row_start >= block_start && row_end <= block_end {
+                                block_id_opt = Some(block_id);
+                                offset_in_block = (row_start - block_start) as u32;
+                                break;
+                            }
+                        }
+
+                        if let Some(block_id) = block_id_opt {
+                            // Zero-copy path
+                            if idx_value == 0 {
+                                match regex.find(bytes) {
+                                    Ok(Some(m)) => {
+                                        let offset = offset_in_block + m.start() as u32;
+                                        let len = (m.end() - m.start()) as u32;
+                                        builder.try_append_view(block_id, offset, len).unwrap();
+                                    }
+                                    _ => builder.append_value(""),
+                                }
+                            } else {
+                                match regex.captures(bytes) {
+                                    Ok(Some(caps)) => {
+                                        if let Some(m) = caps.get(idx_value as usize) {
+                                            let offset = offset_in_block + m.start() as u32;
+                                            let len = (m.end() - m.start()) as u32;
+                                            builder.try_append_view(block_id, offset, len).unwrap();
+                                        } else {
+                                            builder.append_value("");
+                                        }
+                                    }
+                                    _ => builder.append_value(""),
+                                }
+                            }
+                        } else {
+                            // Fallback: string spans blocks, copy it
+                            let capture = match regex.captures(bytes) {
+                                Ok(Some(caps)) => match caps.get(idx_value as usize) {
+                                    Some(m) => &s[m.start()..m.end()],
+                                    None => "",
+                                },
+                                _ => "",
+                            };
+                            builder.append_value(capture);
+                        }
+                    }
+                }
+            }
+            return Ok(Arc::new(builder.finish()));
+        }
+
+        // Fallback: copying path for Utf8View and scalar inputs
         match compiled {
             CompiledRegex::Fast(regex) => {
                 for i in 0..n {
@@ -318,6 +573,202 @@ fn regexp_extract_kernel(
     // Column patterns: use an LRU cache to limit recompilation
     let mut cache = RegexCache::new(64); // Batch-scoped cache
 
+    // Zero-copy path for Utf8 input (StringArray)
+    if let Some(utf8_arr) = string_input.utf8 {
+        let values_buffer = utf8_arr.values().clone();
+
+        // Retention clamp: same 128MB threshold as scalar pattern path
+        const MAX_ZERO_COPY_BUFFER_SIZE: usize = 128 * 1024 * 1024;
+
+        if values_buffer.len() <= MAX_ZERO_COPY_BUFFER_SIZE {
+            let block_id = builder.append_block(values_buffer);
+            let offsets = utf8_arr.offsets();
+
+            for i in 0..n {
+                if utf8_arr.is_null(i) || pattern_input.is_null(i) || idx_input.is_null(i) {
+                    builder.append_null();
+                    continue;
+                }
+                let s = utf8_arr.value(i);
+                let pattern = pattern_input.value_unchecked(i);
+                let idx_value = idx_input.value_unchecked(i);
+                if idx_value < 0 {
+                    return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
+                }
+
+                let row_start = offsets[i] as u32;
+                let regex = cache.get_or_insert(pattern)?;
+
+                // Need to handle Fast and PCRE2 separately to get offsets
+                match &regex {
+                    CompiledRegex::Fast(r) => {
+                        if idx_value == 0 {
+                            // Fast path: idx=0 uses find()
+                            if let Some(m) = r.find(s) {
+                                let offset = row_start + m.start() as u32;
+                                let len = m.len() as u32;
+                                builder.try_append_view(block_id, offset, len).unwrap();
+                            } else {
+                                builder.append_value("");
+                            }
+                        } else {
+                            // Normal path: extract capture group
+                            if let Some(caps) = r.captures(s) {
+                                if let Some(m) = caps.get(idx_value as usize) {
+                                    let offset = row_start + m.start() as u32;
+                                    let len = m.len() as u32;
+                                    builder.try_append_view(block_id, offset, len).unwrap();
+                                } else {
+                                    builder.append_value("");
+                                }
+                            } else {
+                                builder.append_value("");
+                            }
+                        }
+                    }
+                    #[cfg(feature = "pcre2-fallback")]
+                    CompiledRegex::Pcre2(r) => {
+                        let bytes = s.as_bytes();
+                        if idx_value == 0 {
+                            match r.find(bytes) {
+                                Ok(Some(m)) => {
+                                    let offset = row_start + m.start() as u32;
+                                    let len = (m.end() - m.start()) as u32;
+                                    builder.try_append_view(block_id, offset, len).unwrap();
+                                }
+                                _ => builder.append_value(""),
+                            }
+                        } else {
+                            match r.captures(bytes) {
+                                Ok(Some(caps)) => {
+                                    if let Some(m) = caps.get(idx_value as usize) {
+                                        let offset = row_start + m.start() as u32;
+                                        let len = (m.end() - m.start()) as u32;
+                                        builder.try_append_view(block_id, offset, len).unwrap();
+                                    } else {
+                                        builder.append_value("");
+                                    }
+                                }
+                                _ => builder.append_value(""),
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(Arc::new(builder.finish()));
+        }
+        // If buffer > 128MB, fall through to copying path below
+    }
+
+    // Zero-copy path for LargeUtf8 input with column patterns
+    if let Some(large_utf8_arr) = string_input.large_utf8 {
+        const BLOCK_SIZE: i64 = 2 * 1024 * 1024; // 2MB blocks
+        let values_buffer = large_utf8_arr.values();
+        let offsets = large_utf8_arr.offsets();
+
+        // Calculate block boundaries and register blocks
+        let total_bytes = values_buffer.len() as i64;
+        let mut blocks = Vec::new();
+        let mut block_start = 0i64;
+
+        while block_start < total_bytes {
+            let block_end = (block_start + BLOCK_SIZE).min(total_bytes);
+            let block_slice = values_buffer.slice(block_start as usize);
+            let block_id = builder.append_block(block_slice);
+            blocks.push((block_start, block_end, block_id));
+            block_start = block_end;
+        }
+
+        for i in 0..n {
+            if large_utf8_arr.is_null(i) || pattern_input.is_null(i) || idx_input.is_null(i) {
+                builder.append_null();
+                continue;
+            }
+            let s = large_utf8_arr.value(i);
+            let pattern = pattern_input.value_unchecked(i);
+            let idx_value = idx_input.value_unchecked(i);
+            if idx_value < 0 {
+                return Err(DataFusionError::Execution("idx must be >= 0".to_string()));
+            }
+
+            let row_start = offsets[i];
+            let row_end = offsets[i + 1];
+            let regex = cache.get_or_insert(pattern)?;
+
+            // Find which block this string is in
+            let mut block_id_opt = None;
+            let mut offset_in_block = 0u32;
+
+            for &(block_start, block_end, block_id) in &blocks {
+                if row_start >= block_start && row_end <= block_end {
+                    block_id_opt = Some(block_id);
+                    offset_in_block = (row_start - block_start) as u32;
+                    break;
+                }
+            }
+
+            if let Some(block_id) = block_id_opt {
+                // Zero-copy path
+                match &regex {
+                    CompiledRegex::Fast(r) => {
+                        if idx_value == 0 {
+                            if let Some(m) = r.find(s) {
+                                let offset = offset_in_block + m.start() as u32;
+                                let len = m.len() as u32;
+                                builder.try_append_view(block_id, offset, len).unwrap();
+                            } else {
+                                builder.append_value("");
+                            }
+                        } else if let Some(caps) = r.captures(s) {
+                            if let Some(m) = caps.get(idx_value as usize) {
+                                let offset = offset_in_block + m.start() as u32;
+                                let len = m.len() as u32;
+                                builder.try_append_view(block_id, offset, len).unwrap();
+                            } else {
+                                builder.append_value("");
+                            }
+                        } else {
+                            builder.append_value("");
+                        }
+                    }
+                    #[cfg(feature = "pcre2-fallback")]
+                    CompiledRegex::Pcre2(r) => {
+                        let bytes = s.as_bytes();
+                        if idx_value == 0 {
+                            match r.find(bytes) {
+                                Ok(Some(m)) => {
+                                    let offset = offset_in_block + m.start() as u32;
+                                    let len = (m.end() - m.start()) as u32;
+                                    builder.try_append_view(block_id, offset, len).unwrap();
+                                }
+                                _ => builder.append_value(""),
+                            }
+                        } else {
+                            match r.captures(bytes) {
+                                Ok(Some(caps)) => {
+                                    if let Some(m) = caps.get(idx_value as usize) {
+                                        let offset = offset_in_block + m.start() as u32;
+                                        let len = (m.end() - m.start()) as u32;
+                                        builder.try_append_view(block_id, offset, len).unwrap();
+                                    } else {
+                                        builder.append_value("");
+                                    }
+                                }
+                                _ => builder.append_value(""),
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Fallback: string spans blocks, copy it
+                let capture = regex.get_capture(s, idx_value as usize);
+                builder.append_value(capture);
+            }
+        }
+        return Ok(Arc::new(builder.finish()));
+    }
+
+    // Fallback: copying path for Utf8View and scalar inputs
     for i in 0..n {
         if string_input.is_null(i) || pattern_input.is_null(i) || idx_input.is_null(i) {
             builder.append_null();
@@ -546,22 +997,6 @@ impl<'a> ColumnString<'a> {
             arr.value(index)
         } else {
             unreachable!("string input must be scalar or array")
-        }
-    }
-
-    #[inline(always)]
-    fn byte_capacity_hint(&self) -> usize {
-        if let Some(Some(value)) = self.scalar.as_ref() {
-            value.len()
-        } else if let Some(arr) = self.utf8 {
-            arr.values().len()
-        } else if let Some(arr) = self.large_utf8 {
-            arr.values().len()
-        } else if let Some(arr) = self.utf8_view {
-            // StringView stores data in buffers, not a single values array
-            arr.data_buffers().iter().map(|buf| buf.len()).sum()
-        } else {
-            0
         }
     }
 }
