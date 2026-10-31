@@ -14,9 +14,6 @@
 # Run all benchmarks (~2-3 min)
 cargo bench
 
-# Consolidate results into single report
-python3 scripts/consolidate_benchmarks.py
-
 # Run specific group
 cargo bench scalar_pattern
 
@@ -72,24 +69,7 @@ cargo bench -- --baseline step1
 open target/criterion/scalar_pattern/10000/report/index.html
 ```
 
-### Consolidated Reports
-
-The consolidation script reads all Criterion results and generates:
-- **Markdown summary**: `target/bench-report/summary.md`
-- **CSV export**: `target/bench-report/results.csv`
-
-```bash
-# Generate consolidated report after benchmarks
-python3 scripts/consolidate_benchmarks.py
-
-# View summary table
-cat target/bench-report/summary.md
-```
-
-This makes it easy to compare all benchmarks at once and track improvements across stages.
-
 ## Files
 
 - `benchmarks.rs` - Main benchmark suite (10 groups, ~25 benchmarks)
 - `test_data.rs` - Data generators
-- `../scripts/consolidate_benchmarks.py` - Consolidates all results into single report
